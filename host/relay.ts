@@ -156,6 +156,11 @@ export class RelayConn {
       case 'Target.activateTarget':
       case 'Target.detachFromTarget':
         return {};
+      case 'Page.close': {
+        // The extension refuses this for a lent or claimed tab.
+        await this.hub.ext.call('assertClosable', { tabId: this.#target(method, sessionId).tabId });
+        break;
+      }
       case 'Page.bringToFront':
         throw new Error('buu: agents cannot raise tabs; use handoff()');
       case 'Target.createBrowserContext':

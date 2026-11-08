@@ -9,6 +9,8 @@ export type Session = {
   conns: Set<RelayConn>;
   kernel?: Kernel;
   queue: Promise<unknown>;
+  /** Set when the user took a claimed tab back. The next `js` call reports it once. */
+  tookBack?: number;
 };
 
 /** Host state: sessions, their tabs, relay connections, and kernels. */
@@ -75,6 +77,17 @@ export class Hub {
       case 'tabRemoved':
         this.#removeTab(e.tabId);
         break;
+      case 'takenBack': {
+        // The user took a claimed tab back. Stop the running call first, then drop the tab.
+        const t = this.sessions.get(e.session);
+        if (t) {
+          t.tookBack = e.tabId;
+          t.kernel?.kill();
+          t.kernel = undefined;
+        }
+        this.#removeTab(e.tabId);
+        break;
+      }
       case 'tabCreated':
         this.#addTab(this.session(e.session), e.tabId, false);
         break;
@@ -121,9 +134,22 @@ export class Hub {
   runJs(name: string, code: string, timeoutMs: number) {
     const s = this.session(name);
     return this.#serial(s, async () => {
+      if (s.tookBack !== undefined) {
+        const id = s.tookBack;
+        s.tookBack = undefined;
+        throw new Error(`the user took tab ${id} back. buu detached it. Ask the user to lend a tab again.`);
+      }
       const k = await this.#kernel(s, timeoutMs);
       await Promise.all([...s.conns].map((c) => c.reattachLost()));
-      return (await k.call('js', { code }, timeoutMs)) as { ok: boolean; output?: string; error?: string };
+      await this.ext.call('setRunning', { session: name, running: true }).catch(() => {});
+      try {
+        return (await k.call('js', { code }, timeoutMs)) as { ok: boolean; output?: string; error?: string };
+      } catch (e) {
+        if (s.tookBack !== undefined) throw new Error(`the user took tab ${s.tookBack} back. The running call stopped.`);
+        throw e;
+      } finally {
+        await this.ext.call('setRunning', { session: name, running: false }).catch(() => {});
+      }
     });
   }
 
@@ -132,6 +158,7 @@ export class Hub {
     return this.#serial(s, async () => {
       const k = await this.#kernel(s, timeoutMs);
       const tab = await this.ext.call('claimTab', { session: name, tabId });
+      s.tookBack = undefined;
       this.#addTab(s, tabId, true);
       await Promise.all([...s.conns].map((c) => c.attachTab(tabId)));
       const r = await k.call('claim', { url: tab.url }, timeoutMs);

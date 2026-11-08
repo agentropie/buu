@@ -10,6 +10,7 @@ Usage:
   buu js [code]            run JS in the session kernel (code from argument or stdin)
   buu tabs                 list the open tabs of the browser
   buu claim <tabId>        attach a user tab to the session
+  buu claim --lent         attach the one tab the user lent
   buu end [--keep <id>...] end the session and close its tabs
   buu status               show browsers, sessions, and tabs
   buu cdp-url              print the CDP relay URL of the session
@@ -36,6 +37,8 @@ function parse(argv: string[]): Args {
       flags.set(a.slice(2), [v]);
     } else if (a.startsWith('--') && a.includes('=') && valueFlags.has(a.slice(2, a.indexOf('=')))) {
       flags.set(a.slice(2, a.indexOf('=')), [a.slice(a.indexOf('=') + 1)]);
+    } else if (a === '--lent') {
+      flags.set('lent', ['1']);
     } else if (a === '--help' || a === '-h') {
       positional.push('help');
     } else {
@@ -120,15 +123,24 @@ async function main() {
       if (!r.ok) fail(r.error);
       const tabs = (r.data as any[])
         .filter((t) => !t.session || t.claimed)
-        .sort((a, b) => b.lastAccessed - a.lastAccessed);
-      for (const t of tabs) console.log(`${t.id}\t${oneLine(t.title)}\t${t.url}${t.claimed ? `\t(claimed by ${t.session})` : ''}`);
+        .sort((a, b) => Number(b.lent) - Number(a.lent) || b.lastAccessed - a.lastAccessed);
+      for (const t of tabs) console.log(tabLine(t));
       return;
     }
 
     case 'claim': {
-      const tabId = Number(rest[0]);
-      if (!Number.isInteger(tabId)) fail('usage: buu claim <tabId> (get the id from `buu tabs`)');
-      const r = await request(pickBrowser(flag('browser')), { cmd: 'claim', session, tabId, timeoutMs }, wait);
+      const entry = pickBrowser(flag('browser'));
+      let tabId = Number(rest[0]);
+      if (flags.has('lent')) {
+        const all = await request(entry, { cmd: 'tabs' }, 15000);
+        if (!all.ok) fail(all.error);
+        const lent = (all.data as any[]).filter((t) => t.lent && !t.session);
+        if (!lent.length) fail('no tab is lent. Ask the user to click the buu toolbar button on the tab to lend it.');
+        if (lent.length > 1) fail(`${lent.length} tabs are lent. Claim one by id:\n${lent.map(tabLine).join('\n')}`);
+        tabId = lent[0].id;
+      }
+      if (!Number.isInteger(tabId)) fail('usage: buu claim <tabId> | buu claim --lent (get the id from `buu tabs`)');
+      const r = await request(entry, { cmd: 'claim', session, tabId, timeoutMs }, wait);
       if (!r.ok) fail(r.error);
       const d = r.data as any;
       console.log(`claimed tab ${d.tabId} in session "${session}": ${oneLine(d.title)}  ${d.url}`);
@@ -172,6 +184,10 @@ async function main() {
     default:
       fail(`unknown command "${cmd}". Run \`buu help\`.`);
   }
+}
+
+function tabLine(t: any): string {
+  return `${t.id}\t${oneLine(t.title)}\t${t.url}${t.lent ? '\t[lent]' : ''}${t.claimed ? `\t(claimed by ${t.session})` : ''}`;
 }
 
 function oneLine(s: string): string {

@@ -19,6 +19,11 @@ const attached = new Set();
 // Tabs that got CDP commands from a client. A new client must not inherit their enabled domains.
 const used = new Set();
 let instanceId = '';
+// Tabs the user lent by a toolbar click. Kept in storage.session.
+const lent = new Set();
+// Sessions that run a `buu js` call now. Their claimed tabs show RUN.
+const running = new Set();
+let globalColor = '#9a6700';
 
 function log(...args) {
   console.log('[buu]', ...args);
@@ -36,6 +41,7 @@ const ready = (async () => {
   }
   const stored = await chrome.storage.session.get('sessions');
   sessions = stored.sessions ?? {};
+  for (const id of (await chrome.storage.session.get('lent')).lent ?? []) lent.add(id);
   // After a worker restart, debugger sessions of our tabs stay attached.
   const targets = await chrome.debugger.getTargets();
   const mine = new Set(Object.values(sessions).flatMap((s) => [...s.agent, ...s.claimed]));
@@ -45,10 +51,19 @@ const ready = (async () => {
       used.add(t.tabId);
     }
   }
+  for (const id of [...lent, ...mine]) refreshBadge(id);
 })();
 
 function save() {
   return chrome.storage.session.set({ sessions });
+}
+
+function saveLent() {
+  return chrome.storage.session.set({ lent: [...lent] });
+}
+
+function claimedBy(tabId) {
+  return Object.entries(sessions).find(([, s]) => s.claimed.includes(tabId))?.[0];
 }
 
 function sessionOf(tabId) {
@@ -76,9 +91,27 @@ function setState(state, detail) {
     error: ['!', '#cf222e', `buu: error${detail ? ` (${detail})` : ''}`],
   };
   const [text, color, title] = map[state];
+  globalColor = color;
   chrome.action.setBadgeText({ text });
   chrome.action.setBadgeBackgroundColor({ color });
   chrome.action.setTitle({ title });
+}
+
+// Per-tab badge. It overrides the global badge on that tab only. No state: use the global badge.
+function refreshBadge(tabId) {
+  const owner = claimedBy(tabId);
+  let text = null;
+  let color = '#0969da';
+  if (owner && running.has(owner)) {
+    text = 'RUN';
+    color = '#bc4c00';
+  } else if (owner || lent.has(tabId)) {
+    text = 'ON';
+    color = '#1a7f37';
+  }
+  // text null clears the tab value. Then the global badge shows again.
+  chrome.action.setBadgeText({ tabId, text }).catch(() => {});
+  chrome.action.setBadgeBackgroundColor({ tabId, color: text ? color : globalColor }).catch(() => {});
 }
 
 // ---------- native port ----------
@@ -263,6 +296,52 @@ async function groupTitleMap() {
   return m;
 }
 
+// ---------- toolbar click ----------
+
+// One function for every toolbar click. The e2e test calls it through `test.toolbarClick`.
+async function onToolbarClick(tab) {
+  await ready;
+  const tabId = tab.id;
+  if (tabId === undefined) return;
+  if (isAgentTab(tabId)) return; // agent tabs have no toolbar action
+  if (lent.has(tabId) || claimedBy(tabId)) return await takeBack(tabId);
+  try {
+    const t = await chrome.tabs.get(tabId);
+    checkUrl(t.url ?? t.pendingUrl);
+  } catch (e) {
+    log('lend refused', e);
+    return;
+  }
+  lent.add(tabId);
+  await saveLent();
+  refreshBadge(tabId);
+}
+
+// The user takes a lent or claimed tab back. Detach, leave the session, tell the host.
+async function takeBack(tabId) {
+  const owner = claimedBy(tabId);
+  lent.delete(tabId);
+  await saveLent();
+  if (owner) {
+    sessions[owner].claimed = sessions[owner].claimed.filter((i) => i !== tabId);
+    await detach(tabId);
+    await save();
+    send({ event: 'takenBack', tabId, session: owner });
+  }
+  refreshBadge(tabId);
+}
+
+chrome.action.onClicked.addListener((tab) => void onToolbarClick(tab));
+
+// Chrome can reset tab badges on navigation. Apply them again.
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status === 'loading' || info.status === 'complete') refreshBadge(tabId);
+});
+
+function assertClosable(tabId) {
+  if (lent.has(tabId) || claimedBy(tabId)) throw new Error('buu: agents cannot close a lent or claimed tab');
+}
+
 // ---------- RPC ----------
 
 const rpc = {
@@ -310,6 +389,7 @@ const rpc = {
         lastAccessed: t.lastAccessed ?? 0,
         session: sessionOf(t.id) ?? null,
         claimed: Object.values(sessions).some((s) => s.claimed.includes(t.id)),
+        lent: lent.has(t.id),
       }));
   },
 
@@ -356,6 +436,7 @@ const rpc = {
     await attach(tabId);
     ensureSession(session).claimed.push(tabId);
     await save();
+    refreshBadge(tabId);
     return { tabId, url: tab.url ?? '', title: tab.title ?? '' };
   },
 
@@ -368,7 +449,20 @@ const rpc = {
     return { fresh };
   },
 
+  async assertClosable({ tabId }) {
+    assertClosable(tabId);
+    return {};
+  },
+
+  async setRunning({ session, running: on }) {
+    if (on) running.add(session);
+    else running.delete(session);
+    for (const id of sessions[session]?.claimed ?? []) refreshBadge(id);
+    return {};
+  },
+
   async closeTab({ tabId }) {
+    assertClosable(tabId);
     await detach(tabId);
     for (const s of Object.values(sessions)) {
       s.agent = s.agent.filter((i) => i !== tabId);
@@ -386,6 +480,7 @@ const rpc = {
       s.claimed = s.claimed.filter((i) => i !== tabId);
     }
     await save();
+    refreshBadge(tabId);
     return {};
   },
 
@@ -397,6 +492,15 @@ const rpc = {
   },
 
   // Test-only. The host exposes these only when BUU_TEST=1.
+  async 'test.toolbarClick'({ tabId }) {
+    await onToolbarClick({ id: tabId });
+    return {};
+  },
+
+  async 'test.badge'({ tabId }) {
+    return { text: await chrome.action.getBadgeText({ tabId }) };
+  },
+
   async 'test.tabs'() {
     const tabs = await chrome.tabs.query({});
     const groups = await chrome.tabGroups.query({}).catch(() => []);
@@ -426,7 +530,9 @@ const rpc = {
       result.detached.push(id);
     }
     delete sessions[session];
+    running.delete(session);
     await save();
+    for (const id of result.detached) refreshBadge(id);
     return result;
   },
 };
@@ -455,6 +561,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   attached.delete(tabId);
   used.delete(tabId);
+  if (lent.delete(tabId)) await saveLent();
   const name = sessionOf(tabId);
   if (!name) return;
   const s = sessions[name];

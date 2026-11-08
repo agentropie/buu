@@ -48,6 +48,23 @@ function buuWithInput(input: string, ...args: string[]): Promise<{ stdout: strin
   });
 }
 
+type Result = { stdout: string; stderr: string; code: number };
+
+/** Start the CLI and do not wait. `err()` shows the stderr so far. */
+function buuBg(...args: string[]): { done: Promise<Result>; err: () => string } {
+  let err = '';
+  const done = new Promise<Result>((resolve) => {
+    const child = execFile(process.execPath, [cli, ...args], { env }, (e, stdout, stderr) => {
+      resolve({ stdout, stderr, code: e ? ((e as { code?: number }).code ?? 1) : 0 });
+    });
+    child.stderr!.on('data', (d) => (err += d));
+    child.stdin!.end();
+  });
+  return { done, err: () => err };
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 /** Call a test-only extension method through the hidden `buu __test` command. */
 async function ext(method: string, params: Record<string, unknown> = {}): Promise<any> {
   const r = await buu('__test', method, JSON.stringify(params));
@@ -382,6 +399,90 @@ describe('buu e2e on Chrome for Testing', { skip: chrome ? false : 'Chrome for T
     const tabs = await ext('test.tabs');
     assert.equal(tabs.tabs.filter((t: any) => t.active).length, 1); // still the user tab
     await buu('--session', 'bg', 'end');
+  });
+
+  test('v1.1: lend by toolbar click, claim --lent, take back stops the running call', async () => {
+    const id = Number(/^(\d+)\t.*User Page/m.exec((await buu('tabs')).stdout)![1]);
+    const none = await buu('--session', 'L', 'claim', '--lent');
+    assert.equal(none.code, 1);
+    assert.match(none.stderr, /no tab is lent/);
+
+    await ext('test.toolbarClick', { tabId: id }); // the user lends the tab
+    assert.equal((await ext('test.badge', { tabId: id })).text, 'ON');
+    const first = (await buu('tabs')).stdout.split('\n')[0];
+    assert.match(first, new RegExp(`^${id}\\tUser Page\\t.*\\t\\[lent\\]$`));
+
+    const c = await buu('--session', 'L', 'claim', '--lent');
+    assert.equal(c.code, 0, c.stderr);
+    assert.equal((await buu('--session', 'L', 'js', 'return await page.title()')).stdout.trim(), '"User Page"');
+    // RUN shows while a call runs. The user takes the tab back during the call.
+    const run = buuBg('--session', 'L', 'js', 'await new Promise((r) => setTimeout(r, 20000))');
+    await waitFor(async () => (await ext('test.badge', { tabId: id })).text === 'RUN', 5000, 'the RUN badge');
+    await ext('test.toolbarClick', { tabId: id });
+    const r = await run.done;
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /the user took tab \d+ back/);
+    assert.equal((await ext('test.badge', { tabId: id })).text, 'on'); // the global badge again
+    assert.doesNotMatch((await buu('status')).stdout, new RegExp(`tab ${id} `));
+    assert.match((await buu('tabs')).stdout, /User Page/); // the tab stays open
+    assert.doesNotMatch((await buu('tabs')).stdout, /\[lent\]/);
+
+    const next = await buu('--session', 'L', 'js', 'return 1');
+    assert.equal(next.code, 1);
+    assert.match(next.stderr, /the user took tab \d+ back/);
+    const after = await buu('--session', 'L', 'js', 'return 1'); // reported once
+    assert.equal(after.code, 0, after.stderr);
+    await buu('--session', 'L', 'end');
+  });
+
+  test('v1.1: agents cannot close a lent or claimed tab', async () => {
+    const id = Number(/^(\d+)\t.*User Page/m.exec((await buu('tabs')).stdout)![1]);
+    await ext('test.toolbarClick', { tabId: id });
+    assert.equal((await buu('--session', 'X', 'claim', '--lent')).code, 0);
+    // A raw CDP client on the same session. Playwright page.close() hides the refusal and waits.
+    const url = (await buu('--session', 'X', 'cdp-url')).stdout.trim();
+    const ws = new WebSocket(url);
+    await new Promise((r, j) => ws.once('open', r).once('error', j));
+    const targetId = await new Promise<string>((resolve) => {
+      ws.on('message', (d) => {
+        const m = JSON.parse(String(d));
+        if (m.method === 'Target.attachedToTarget') resolve(m.params.targetInfo.targetId);
+      });
+      ws.send(JSON.stringify({ id: 1, method: 'Target.setAutoAttach', params: { autoAttach: true, waitForDebuggerOnStart: false, flatten: true } }));
+    });
+    const reply = new Promise<any>((resolve) =>
+      ws.on('message', (d) => {
+        const m = JSON.parse(String(d));
+        if (m.id === 2) resolve(m);
+      }),
+    );
+    ws.send(JSON.stringify({ id: 2, method: 'Target.closeTarget', params: { targetId } }));
+    assert.match((await reply).error?.message, /agents cannot close a lent or claimed tab/);
+    ws.close();
+    assert.match((await buu('tabs')).stdout, /User Page/);
+    await buu('--session', 'X', 'end'); // never closes a claimed tab
+    assert.match((await buu('tabs')).stdout, /User Page/);
+    await ext('test.toolbarClick', { tabId: id }); // take back
+  });
+
+  test('v1.1: a second toolbar click on a lent tab takes it back', async () => {
+    const id = Number(/^(\d+)\t.*User Page/m.exec((await buu('tabs')).stdout)![1]);
+    await ext('test.toolbarClick', { tabId: id });
+    assert.match((await buu('tabs')).stdout, /\[lent\]/);
+    await ext('test.toolbarClick', { tabId: id });
+    assert.doesNotMatch((await buu('tabs')).stdout, /\[lent\]/);
+    assert.equal((await ext('test.badge', { tabId: id })).text, 'on');
+  });
+
+  test('v1.1: claim --lent fails with the list when many tabs are lent', async () => {
+    const ids = [...(await buu('tabs')).stdout.matchAll(/^(\d+)\t/gm)].map((m) => Number(m[1]));
+    assert.ok(ids.length >= 2, 'need two user tabs');
+    for (const id of ids.slice(0, 2)) await ext('test.toolbarClick', { tabId: id });
+    const r = await buu('--session', 'M', 'claim', '--lent');
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /2 tabs are lent/);
+    assert.equal((r.stderr.match(/\[lent\]/g) ?? []).length, 2);
+    for (const id of ids.slice(0, 2)) await ext('test.toolbarClick', { tabId: id });
   });
 
   test('8 (host crash): the extension starts the host again within 15 s', async () => {
