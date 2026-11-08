@@ -184,6 +184,11 @@ describe('buu e2e on Chrome for Testing', { skip: chrome ? false : 'Chrome for T
     web = createServer((req, res) => {
       const titles: Record<string, string> = { '/user': 'User Page', '/a': 'Page A', '/b': 'Page B', '/pop': 'Popup Page' };
       res.setHeader('content-type', 'text/html');
+      if (req.url === '/top') {
+        // A page popover in the top layer. It covers the whole page.
+        res.end('<!doctype html><title>Top Page</title><div id=p popover=manual style="position:fixed;inset:0;margin:0;width:100vw;height:100vh;background:#00f">cover</div><script>p.showPopover()</script>');
+        return;
+      }
       if (req.url === '/red') {
         res.end('<!doctype html><title>Red Page</title><body style="margin:0;background:#fff"><div style="width:300px;height:200px;background:#f00"></div>');
         return;
@@ -433,12 +438,40 @@ describe('buu e2e on Chrome for Testing', { skip: chrome ? false : 'Chrome for T
     assert.match((await buu('tabs')).stdout, /User Page/); // the tab stays open
     assert.doesNotMatch((await buu('tabs')).stdout, /\[lent\]/);
 
-    const next = await buu('--session', 'L', 'js', 'return 1');
+    const next = await buu('--session', 'L', 'js', 'return 1'); // the running call reported it already
+    assert.equal(next.code, 0, next.stderr);
+    await buu('--session', 'L', 'end');
+  });
+
+  test('v1.1: a take-back between calls is reported once', async () => {
+    const id = Number(/^(\d+)\t.*User Page/m.exec((await buu('tabs')).stdout)![1]);
+    await ext('test.toolbarClick', { tabId: id });
+    assert.equal((await buu('--session', 'T', 'claim', '--lent')).code, 0);
+    await ext('test.toolbarClick', { tabId: id }); // no call runs
+    const next = await buu('--session', 'T', 'js', 'return 1');
     assert.equal(next.code, 1);
     assert.match(next.stderr, /the user took tab \d+ back/);
-    const after = await buu('--session', 'L', 'js', 'return 1'); // reported once
+    const after = await buu('--session', 'T', 'js', 'return 1');
     assert.equal(after.code, 0, after.stderr);
-    await buu('--session', 'L', 'end');
+    await buu('--session', 'T', 'end');
+  });
+
+  test('v1.1: a host crash clears the RUN badge of a claimed tab', async () => {
+    const id = Number(/^(\d+)\t.*User Page/m.exec((await buu('tabs')).stdout)![1]);
+    await ext('test.toolbarClick', { tabId: id });
+    assert.equal((await buu('--session', 'R', 'claim', '--lent')).code, 0);
+    const run = buuBg('--session', 'R', 'js', 'await new Promise((r) => setTimeout(r, 20000))');
+    await waitFor(async () => (await ext('test.badge', { tabId: id })).text === 'RUN', 5000, 'the RUN badge');
+    const pid = Number(/pid (\d+)/.exec((await buu('status')).stdout)![1]);
+    process.kill(pid, 'SIGKILL');
+    await run.done;
+    await waitFor(async () => {
+      const m = /pid (\d+)/.exec((await buu('status')).stdout);
+      return !!m && Number(m[1]) !== pid;
+    }, 15000, 'the extension to start a new host');
+    assert.equal((await ext('test.badge', { tabId: id })).text, 'ON'); // claimed, no call runs
+    await ext('test.toolbarClick', { tabId: id }); // take back
+    assert.equal((await ext('test.badge', { tabId: id })).text, 'on');
   });
 
   test('v1.1: agents cannot close a lent or claimed tab', async () => {
@@ -532,6 +565,17 @@ describe('buu e2e on Chrome for Testing', { skip: chrome ? false : 'Chrome for T
       assert.equal(r.code, 0, r.stderr);
       assert.equal(r.stdout.trim(), `"${base}/b"`);
       assert.equal(await ext('test.card', { tabId: id }), null);
+    });
+
+    test('the card stays on top of a page popover, so a click on it continues', async () => {
+      assert.equal((await buu('--session', 'H', 'js', `await page.goto('${base}/top')`)).code, 0);
+      const id = await agentTab();
+      const run = buuBg('--session', 'H', 'js', `await handoff('Under a popover', { timeoutMs: 60000 }); return 'continued'`);
+      await waitFor(cardShown(id), 8000, 'the handoff card');
+      await ext('test.cardClick', { tabId: id }); // a click on a covered card would hit the page
+      const r = await run.done;
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(r.stdout.trim(), '"continued"');
     });
 
     test('start runs after the card shows, and a failing start ends the handoff', async () => {

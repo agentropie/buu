@@ -121,6 +121,12 @@ export class Hub {
     return tabId;
   }
 
+  /** Drop a claimed tab from its session. The tab stays open in the browser. */
+  async releaseTab(tabId: number): Promise<void> {
+    await this.ext.call('detachTab', { tabId });
+    this.#removeTab(tabId);
+  }
+
   async closeTab(s: Session, tabId: number): Promise<void> {
     await this.ext.call('closeTab', { tabId });
     this.#removeTab(tabId);
@@ -142,7 +148,8 @@ export class Hub {
       `${this.relayBase}/${s.name}`,
       this.log,
       () => {
-        if (s.kernel === k) s.kernel = undefined;
+        if (s.kernel && s.kernel !== k) return; // a newer kernel owns the session now
+        s.kernel = undefined;
         this.#endHandoff(s, new Error('handoff stopped: the kernel exited'));
       },
       (op, payload) => this.#kernelRequest(s, op, payload),
@@ -246,7 +253,11 @@ export class Hub {
       try {
         return (await k.call('js', { code }, timeoutMs)) as { ok: boolean; output?: string; error?: string };
       } catch (e) {
-        if (s.tookBack !== undefined) throw new Error(`the user took tab ${s.tookBack} back. The running call stopped.`);
+        if (s.tookBack !== undefined) {
+          const id = s.tookBack;
+          s.tookBack = undefined; // report it once
+          throw new Error(`the user took tab ${id} back. The running call stopped.`);
+        }
         throw e;
       } finally {
         s.emit = undefined;

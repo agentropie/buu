@@ -54,6 +54,8 @@ const ready = (async () => {
     }
   }
   for (const id of [...lent, ...mine]) refreshBadge(id);
+  // The handoffs died with the old worker. Remove the cards they left in the pages.
+  for (const id of mine) inCardWorld(id, cardRemove).catch(() => {});
 })();
 
 function save() {
@@ -157,6 +159,8 @@ function connect() {
     const err = chrome.runtime.lastError?.message;
     if (port === p) port = null;
     for (const id of [...handoffs.keys()]) void clearHandoff(id); // nobody waits for the user now
+    running.clear(); // no call runs without the host
+    for (const s of Object.values(sessions)) for (const id of s.claimed) refreshBadge(id);
     if (Date.now() - startedAt >= HEALTHY_MS) {
       // Host crash or browser-side restart. Reconnect at once. This starts a new host.
       attempt = 0;
@@ -364,6 +368,7 @@ function cardInject(message) {
   };
   const host = document.createElement('div');
   host.style.cssText = 'all: initial; position: fixed; top: 16px; right: 16px; z-index: 2147483647;';
+  host.popover = 'manual'; // the top layer. A page dialog or popover cannot cover the card.
   const root = host.attachShadow({ mode: 'closed' });
   const font = 'font: 14px/1.4 system-ui, sans-serif; color: #1f2328;';
   const card = el('div', `${font} width: 300px; box-sizing: border-box; padding: 14px; background: #fff; border: 2px solid #cf222e; border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.3);`);
@@ -377,6 +382,9 @@ function cardInject(message) {
   card.append(title, origin, text, button);
   root.append(card);
   document.documentElement.append(host);
+  try {
+    host.showPopover();
+  } catch {} // without the top layer the z-index still applies
   g.__buuCard = { host, text, button };
 }
 
