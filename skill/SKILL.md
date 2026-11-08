@@ -7,6 +7,17 @@ description: Drive the user's real, logged-in Chromium browser (Chrome, Dia) fro
 
 `buu` runs Playwright code in the user's real browser. The browser keeps its profile and logins. Each agent session gets its own tab group.
 
+## Install
+
+Source: https://github.com/agentropie/buu. If `buu` is not installed or `buu doctor` fails, install it with these commands:
+
+```sh
+git clone https://github.com/agentropie/buu ~/code/buu && cd ~/code/buu
+npm install && npm link && buu install
+```
+
+Then ask the user to load the `extension/` folder unpacked in `chrome://extensions` (Developer mode). Only the user can do this step. The README has the full steps.
+
 ## Commands
 
 | Command | Effect |
