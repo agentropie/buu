@@ -374,6 +374,7 @@ const rpc = {
     for (const id of sess.agent) {
       if (keep.includes(id)) {
         await detach(id);
+        await chrome.tabs.ungroup(id).catch(() => {});
         result.kept.push(id);
       } else {
         await detach(id);

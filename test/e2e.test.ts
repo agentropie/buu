@@ -237,6 +237,16 @@ describe('buu e2e on Chrome for Testing', { skip: chrome ? false : 'Chrome for T
     assert.match((await buu('tabs')).stdout, new RegExp(`^${id}\\t`, 'm'));
   });
 
+  test('a kept tab leaves the session group', async () => {
+    // Claim the kept tab. status shows the group title when the tab is still in a group.
+    const id = /^(\d+)\t.*Page B/m.exec((await buu('tabs')).stdout)![1];
+    const c = await buu('--session', 'k2', 'claim', id);
+    assert.equal(c.code, 0, c.stderr);
+    const s = (await buu('status')).stdout;
+    assert.match(s, new RegExp(`tab ${id}  \\[claimed\\]  Page B`));
+    await buu('--session', 'k2', 'end');
+  });
+
   test('8 (host crash): the extension starts the host again within 15 s', async () => {
     const pid = Number(/pid (\d+)/.exec((await buu('status')).stdout)![1]);
     process.kill(pid, 'SIGKILL'); // the host is our own child of the test browser
