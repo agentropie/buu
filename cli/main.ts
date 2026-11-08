@@ -161,6 +161,14 @@ async function main() {
       return;
     }
 
+    case '__test': {
+      // Hidden. The host answers only when BUU_TEST=1. The e2e test uses it for fake toolbar clicks.
+      const r = await request(pickBrowser(flag('browser')), { cmd: 'test', method: rest[0], params: rest[1] ? JSON.parse(rest[1]) : {} }, 15000);
+      if (!r.ok) fail(r.error);
+      console.log(JSON.stringify(r.data));
+      return;
+    }
+
     default:
       fail(`unknown command "${cmd}". Run \`buu help\`.`);
   }

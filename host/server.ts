@@ -5,11 +5,13 @@ import type { Hub } from './hub.ts';
 import { runDir } from './paths.ts';
 
 export type Request = {
-  cmd: 'js' | 'tabs' | 'claim' | 'end' | 'status' | 'ping';
+  cmd: 'js' | 'tabs' | 'claim' | 'end' | 'status' | 'ping' | 'test';
   session?: string;
   code?: string;
   tabId?: number;
   keep?: number[];
+  method?: string;
+  params?: Record<string, unknown>;
   timeoutMs?: number;
 };
 export type Response = { ok: true; data?: unknown; output?: string } | { ok: false; error: string; output?: string };
@@ -68,6 +70,10 @@ async function handle(hub: Hub, req: Request, info: () => unknown): Promise<Resp
       return { ok: true, data: await hub.claim(session, Number(req.tabId), timeoutMs) };
     case 'end':
       return { ok: true, data: await hub.end(session, req.keep ?? []) };
+    case 'test':
+      // Test-only RPC to the extension (fake toolbar clicks and so on). Off unless BUU_TEST=1.
+      if (process.env.BUU_TEST !== '1' || !req.method?.startsWith('test.')) return { ok: false, error: 'unknown command test' };
+      return { ok: true, data: await hub.ext.call(req.method, req.params ?? {}) };
     default:
       return { ok: false, error: `unknown command ${(req as { cmd: string }).cmd}` };
   }

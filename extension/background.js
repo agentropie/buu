@@ -58,6 +58,10 @@ function sessionOf(tabId) {
   return undefined;
 }
 
+function isAgentTab(tabId) {
+  return Object.values(sessions).some((s) => s.agent.includes(tabId));
+}
+
 function ensureSession(name) {
   return (sessions[name] ??= { agent: [], claimed: [], groupId: null });
 }
@@ -175,6 +179,12 @@ async function attach(tabId) {
   if (attached.has(tabId)) return;
   await chrome.debugger.attach({ tabId }, '1.3');
   attached.add(tabId);
+  if (isAgentTab(tabId)) {
+    // A background tab must render. Without this, screenshots, rAF, and timers can stall.
+    await chrome.debugger
+      .sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true })
+      .catch((e) => log('focus emulation failed', e));
+  }
 }
 
 async function detach(tabId) {
@@ -201,6 +211,18 @@ async function addToGroup(name, sess, tabId, windowId) {
     sess.groupId = groupId;
   } catch (e) {
     log('tab group failed (continuing without a group)', e);
+  }
+}
+
+// Keep the session group out of the way. Skip it when the user looks at a tab of the group.
+async function collapseGroup(sess) {
+  if (sess.groupId == null) return;
+  try {
+    const looking = await chrome.tabs.query({ active: true, groupId: sess.groupId });
+    if (looking.length) return;
+    await chrome.tabGroups.update(sess.groupId, { collapsed: true });
+  } catch (e) {
+    log('collapse group failed (continuing)', e);
   }
 }
 
@@ -298,7 +320,7 @@ const rpc = {
     const windowId = await sessionWindowId(sess);
     // The tab joins the session in the same promise. onCreated waits for it (see below).
     const creation = chrome.tabs
-      .create({ url: target, active: true, ...(windowId !== undefined ? { windowId } : {}) })
+      .create({ url: target, active: false, ...(windowId !== undefined ? { windowId } : {}) })
       .then((t) => {
         sess.agent.push(t.id);
         return t;
@@ -320,6 +342,7 @@ const rpc = {
       throw e;
     }
     await addToGroup(session, sess, tab.id, tab.windowId);
+    await collapseGroup(sess);
     return { tabId: tab.id, windowId: tab.windowId };
   },
 
@@ -371,6 +394,16 @@ const rpc = {
     if (method !== 'Target.getTargetInfo') used.add(tabId);
     const target = sessionId ? { tabId, sessionId } : { tabId };
     return await chrome.debugger.sendCommand(target, method, params);
+  },
+
+  // Test-only. The host exposes these only when BUU_TEST=1.
+  async 'test.tabs'() {
+    const tabs = await chrome.tabs.query({});
+    const groups = await chrome.tabGroups.query({}).catch(() => []);
+    return {
+      tabs: tabs.map((t) => ({ id: t.id, active: t.active, windowId: t.windowId, groupId: t.groupId, url: t.url ?? '' })),
+      groups: groups.map((g) => ({ id: g.id, title: g.title, collapsed: g.collapsed })),
+    };
   },
 
   async endSession({ session, keep = [] }) {
@@ -459,6 +492,7 @@ chrome.tabs.onCreated.addListener(async (tab) => {
     await save();
     await attach(tab.id);
     await addToGroup(name, sess, tab.id, tab.windowId);
+    await collapseGroup(sess);
     send({ event: 'tabCreated', session: name, tabId: tab.id });
   } catch (e) {
     log('popup attach failed', e);

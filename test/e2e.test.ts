@@ -8,6 +8,8 @@ import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import { inflateSync } from 'node:zlib';
+import { WebSocket } from 'ws';
 
 const repo = join(fileURLToPath(import.meta.url), '..', '..');
 const cli = join(repo, 'cli', 'main.ts');
@@ -30,7 +32,7 @@ const chrome = findChrome();
 // Unix socket paths are limited to 104 bytes on macOS, and $TMPDIR is long. Use /tmp.
 const tmp = mkdtempSync(join('/tmp', 'buu-e2e-'));
 const profile = join(tmp, 'profile');
-const env: NodeJS.ProcessEnv = { ...process.env, BUU_HOME: join(tmp, 'buu') };
+const env: NodeJS.ProcessEnv = { ...process.env, BUU_HOME: join(tmp, 'buu'), BUU_TEST: '1' };
 delete env.NODE_TEST_CONTEXT; // node --test marks child node processes. That breaks the CLI and host output.
 
 function buu(...args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
@@ -44,6 +46,73 @@ function buuWithInput(input: string, ...args: string[]): Promise<{ stdout: strin
     });
     child.stdin!.end(input);
   });
+}
+
+/** Call a test-only extension method through the hidden `buu __test` command. */
+async function ext(method: string, params: Record<string, unknown> = {}): Promise<any> {
+  const r = await buu('__test', method, JSON.stringify(params));
+  assert.equal(r.code, 0, r.stderr);
+  return JSON.parse(r.stdout);
+}
+
+/** Decode an 8-bit non-interlaced PNG into RGBA pixels (enough for Chrome screenshots). */
+function decodePng(buf: Buffer): { width: number; height: number; pixels: (x: number, y: number) => [number, number, number] } {
+  assert.equal(buf.subarray(1, 4).toString(), 'PNG');
+  let off = 8;
+  let width = 0;
+  let height = 0;
+  let channels = 4;
+  const idat: Buffer[] = [];
+  while (off < buf.length) {
+    const len = buf.readUInt32BE(off);
+    const type = buf.subarray(off + 4, off + 8).toString();
+    const data = buf.subarray(off + 8, off + 8 + len);
+    if (type === 'IHDR') {
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      assert.equal(data[8], 8, 'bit depth');
+      channels = data[9] === 6 ? 4 : data[9] === 2 ? 3 : 0;
+      assert.ok(channels, `color type ${data[9]}`);
+    } else if (type === 'IDAT') idat.push(data);
+    off += 12 + len;
+  }
+  const raw = inflateSync(Buffer.concat(idat));
+  const stride = width * channels;
+  const out = Buffer.alloc(stride * height);
+  for (let y = 0; y < height; y++) {
+    const f = raw[y * (stride + 1)];
+    for (let i = 0; i < stride; i++) {
+      const x = raw[y * (stride + 1) + 1 + i];
+      const a = i >= channels ? out[y * stride + i - channels] : 0;
+      const b = y ? out[(y - 1) * stride + i] : 0;
+      const c = y && i >= channels ? out[(y - 1) * stride + i - channels] : 0;
+      let v = x;
+      if (f === 1) v += a;
+      else if (f === 2) v += b;
+      else if (f === 3) v += (a + b) >> 1;
+      else if (f === 4) {
+        const p = a + b - c;
+        const pa = Math.abs(p - a);
+        const pb = Math.abs(p - b);
+        const pc = Math.abs(p - c);
+        v += pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+      }
+      out[y * stride + i] = v & 255;
+    }
+  }
+  return { width, height, pixels: (x, y) => [out[y * stride + x * channels], out[y * stride + x * channels + 1], out[y * stride + x * channels + 2]] };
+}
+
+/** Send one raw CDP command to the relay of a session and return the reply. */
+async function rawCdp(session: string, method: string, params: object = {}): Promise<any> {
+  const url = (await buu('--session', session, 'cdp-url')).stdout.trim();
+  const ws = new WebSocket(url);
+  await new Promise((r, j) => ws.once('open', r).once('error', j));
+  const reply = new Promise<any>((r) => ws.on('message', (d) => r(JSON.parse(String(d)))));
+  ws.send(JSON.stringify({ id: 1, method, params }));
+  const msg = await reply;
+  ws.close();
+  return msg;
 }
 
 let web: Server;
@@ -92,6 +161,10 @@ describe('buu e2e on Chrome for Testing', { skip: chrome ? false : 'Chrome for T
     web = createServer((req, res) => {
       const titles: Record<string, string> = { '/user': 'User Page', '/a': 'Page A', '/b': 'Page B', '/pop': 'Popup Page' };
       res.setHeader('content-type', 'text/html');
+      if (req.url === '/red') {
+        res.end('<!doctype html><title>Red Page</title><body style="margin:0;background:#fff"><div style="width:300px;height:200px;background:#f00"></div>');
+        return;
+      }
       res.end(`<!doctype html><title>${titles[req.url ?? ''] ?? 'Other'}</title><h1>${req.url}</h1>`);
     });
     await new Promise<void>((r) => web.listen(0, '127.0.0.1', r));
@@ -270,6 +343,45 @@ describe('buu e2e on Chrome for Testing', { skip: chrome ? false : 'Chrome for T
     assert.equal(((await buu('status')).stdout.match(/\[buu · p\]/g) ?? []).length, 26); // the page and 25 popups
     await buu('--session', 'n', 'end');
     await buu('--session', 'p', 'end');
+  });
+
+  test('v1.1: a new agent tab opens in the background, in a collapsed group', async () => {
+    const before = await ext('test.tabs');
+    const user = before.tabs.find((t: any) => t.active);
+    const r = await buu('--session', 'bg', 'js', `await page.goto('${base}/red'); return await page.title()`);
+    assert.equal(r.stdout.trim(), '"Red Page"');
+    const id = Number(/tab (\d+)  \[buu · bg\]/.exec((await buu('status')).stdout)![1]);
+    const after = await ext('test.tabs');
+    assert.equal(after.tabs.find((t: any) => t.id === id).active, false);
+    assert.equal(after.tabs.find((t: any) => t.id === user.id).active, true);
+    const group = after.groups.find((g: any) => g.title === 'buu · bg');
+    assert.equal(group?.collapsed, true);
+  });
+
+  test('v1.1: shot of a background tab is a real image', async () => {
+    const r = await buu('--session', 'bg', 'js', 'await shot()');
+    assert.equal(r.code, 0, r.stderr);
+    const png = decodePng(readFileSync(r.stdout.trim()));
+    assert.equal(png.pixels(100, 100).join(), '255,0,0'); // the red block
+    assert.equal(png.pixels(png.width - 5, png.height - 5).join(), '255,255,255'); // the white page
+  });
+
+  test('v1.1: requestAnimationFrame runs in a background tab', async () => {
+    const r = await buu('--session', 'bg', 'js', `return await page.evaluate(() => new Promise((res) => requestAnimationFrame((t) => res(typeof t))))`);
+    assert.equal(r.stdout.trim(), '"number"');
+  });
+
+  test('v1.1: agents cannot raise a tab', async () => {
+    const r = await buu('--session', 'bg', 'js', 'await page.bringToFront()');
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /buu: agents cannot raise tabs; use handoff\(\)/);
+    const raw = await rawCdp('raw', 'Page.bringToFront');
+    assert.match(raw.error?.message, /agents cannot raise tabs/);
+    const act = await rawCdp('raw', 'Target.activateTarget', { targetId: 'x' });
+    assert.deepEqual(act.result, {}); // a no-op success
+    const tabs = await ext('test.tabs');
+    assert.equal(tabs.tabs.filter((t: any) => t.active).length, 1); // still the user tab
+    await buu('--session', 'bg', 'end');
   });
 
   test('8 (host crash): the extension starts the host again within 15 s', async () => {

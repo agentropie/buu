@@ -156,6 +156,8 @@ export class RelayConn {
       case 'Target.activateTarget':
       case 'Target.detachFromTarget':
         return {};
+      case 'Page.bringToFront':
+        throw new Error('buu: agents cannot raise tabs; use handoff()');
       case 'Target.createBrowserContext':
       case 'Target.disposeBrowserContext':
         throw new Error('buu: extra browser contexts are not supported. Use context.newPage().');
