@@ -23,6 +23,8 @@ let instanceId = '';
 const lent = new Set();
 // Sessions that run a `buu js` call now. Their claimed tabs show RUN.
 const running = new Set();
+// tabId -> { message, session }. A handoff waits for the user in that tab.
+const handoffs = new Map();
 let globalColor = '#9a6700';
 
 function log(...args) {
@@ -102,7 +104,10 @@ function refreshBadge(tabId) {
   const owner = claimedBy(tabId);
   let text = null;
   let color = '#0969da';
-  if (owner && running.has(owner)) {
+  if (handoffs.has(tabId)) {
+    text = 'WAIT';
+    color = '#cf222e';
+  } else if (owner && running.has(owner)) {
     text = 'RUN';
     color = '#bc4c00';
   } else if (owner || lent.has(tabId)) {
@@ -151,6 +156,7 @@ function connect() {
   p.onDisconnect.addListener(() => {
     const err = chrome.runtime.lastError?.message;
     if (port === p) port = null;
+    for (const id of [...handoffs.keys()]) void clearHandoff(id); // nobody waits for the user now
     if (Date.now() - startedAt >= HEALTHY_MS) {
       // Host crash or browser-side restart. Reconnect at once. This starts a new host.
       attempt = 0;
@@ -303,6 +309,7 @@ async function onToolbarClick(tab) {
   await ready;
   const tabId = tab.id;
   if (tabId === undefined) return;
+  if (handoffs.has(tabId)) return await continueHandoff(tabId);
   if (isAgentTab(tabId)) return; // agent tabs have no toolbar action
   if (lent.has(tabId) || claimedBy(tabId)) return await takeBack(tabId);
   try {
@@ -336,6 +343,100 @@ chrome.action.onClicked.addListener((tab) => void onToolbarClick(tab));
 // Chrome can reset tab badges on navigation. Apply them again.
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.status === 'loading' || info.status === 'complete') refreshBadge(tabId);
+  if (info.status === 'complete') void showCard(tabId); // a page load removes the card. Show it again.
+});
+
+// ---------- handoff ----------
+
+// The card runs in the isolated world of the extension. Page scripts cannot reach it.
+// It sits in a closed shadow root. It uses no innerHTML and no <style>, so page CSP and Trusted Types do not matter.
+function cardInject(message) {
+  const g = globalThis;
+  if (g.__buuCard?.host.isConnected) {
+    g.__buuCard.text.textContent = message;
+    return;
+  }
+  const el = (tag, css, text) => {
+    const e = document.createElement(tag);
+    e.style.cssText = css;
+    if (text) e.textContent = text;
+    return e;
+  };
+  const host = document.createElement('div');
+  host.style.cssText = 'all: initial; position: fixed; top: 16px; right: 16px; z-index: 2147483647;';
+  const root = host.attachShadow({ mode: 'closed' });
+  const font = 'font: 14px/1.4 system-ui, sans-serif; color: #1f2328;';
+  const card = el('div', `${font} width: 300px; box-sizing: border-box; padding: 14px; background: #fff; border: 2px solid #cf222e; border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.3);`);
+  const title = el('div', 'font-weight: 700; margin-bottom: 2px;', 'buu needs you');
+  const origin = el('div', 'font-size: 12px; color: #656d76; margin-bottom: 8px;', location.origin);
+  const text = el('div', 'margin-bottom: 10px; white-space: pre-wrap;', message);
+  const button = el('button', `${font} cursor: pointer; padding: 6px 14px; border: 0; border-radius: 6px; background: #1a7f37; color: #fff; font-weight: 600;`, 'Continue');
+  button.addEventListener('click', (e) => {
+    if (e.isTrusted) chrome.runtime.sendMessage({ type: 'buu-continue' });
+  });
+  card.append(title, origin, text, button);
+  root.append(card);
+  document.documentElement.append(host);
+  g.__buuCard = { host, text, button };
+}
+
+function cardRemove() {
+  const g = globalThis;
+  g.__buuCard?.host.remove();
+  delete g.__buuCard;
+}
+
+function cardInfo() {
+  const c = globalThis.__buuCard;
+  if (!c?.host.isConnected) return null;
+  const r = c.button.getBoundingClientRect();
+  return { message: c.text.textContent, origin: location.origin, href: location.href, rect: { x: r.x, y: r.y, width: r.width, height: r.height } };
+}
+
+async function inCardWorld(tabId, func, args = []) {
+  const [res] = await chrome.scripting.executeScript({ target: { tabId }, world: 'ISOLATED', func, args });
+  return res?.result;
+}
+
+async function showCard(tabId) {
+  const h = handoffs.get(tabId);
+  if (!h) return;
+  try {
+    await inCardWorld(tabId, cardInject, [h.message]);
+  } catch (e) {
+    log('handoff card failed (the badge and the toolbar still work)', e); // for example about:blank
+  }
+}
+
+// The user must see the tab. This is the one place buu raises a tab. It never focuses the window.
+async function revealTab(tabId) {
+  try {
+    const t = await chrome.tabs.get(tabId);
+    if (t.groupId !== undefined && t.groupId !== -1) await chrome.tabGroups.update(t.groupId, { collapsed: false }).catch(() => {});
+    await chrome.tabs.update(tabId, { active: true });
+  } catch (e) {
+    log('reveal tab failed', e);
+  }
+}
+
+async function clearHandoff(tabId) {
+  if (!handoffs.delete(tabId)) return false;
+  refreshBadge(tabId);
+  try {
+    await inCardWorld(tabId, cardRemove);
+  } catch {}
+  return true;
+}
+
+// The user clicked Continue in the card, or clicked the toolbar button.
+async function continueHandoff(tabId) {
+  if (await clearHandoff(tabId)) send({ event: 'handoffDone', tabId });
+}
+
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (msg?.type === 'buu-continue' && sender.id === chrome.runtime.id && sender.tab?.id !== undefined) {
+    void continueHandoff(sender.tab.id);
+  }
 });
 
 function assertClosable(tabId) {
@@ -449,6 +550,20 @@ const rpc = {
     return { fresh };
   },
 
+  async handoffBegin({ session, tabId, message }) {
+    if (handoffs.has(tabId)) throw new Error(`a handoff already waits in tab ${tabId}`);
+    handoffs.set(tabId, { message, session });
+    refreshBadge(tabId);
+    await revealTab(tabId);
+    await showCard(tabId);
+    return {};
+  },
+
+  async handoffEnd({ tabId }) {
+    await clearHandoff(tabId);
+    return {};
+  },
+
   async assertClosable({ tabId }) {
     assertClosable(tabId);
     return {};
@@ -494,6 +609,27 @@ const rpc = {
   // Test-only. The host exposes these only when BUU_TEST=1.
   async 'test.toolbarClick'({ tabId }) {
     await onToolbarClick({ id: tabId });
+    return {};
+  },
+
+  async 'test.card'({ tabId }) {
+    return await inCardWorld(tabId, cardInfo);
+  },
+
+  // A real mouse click on the Continue button. It goes through Chrome input, as a user click does.
+  async 'test.cardClick'({ tabId }) {
+    const info = await inCardWorld(tabId, cardInfo);
+    if (!info) throw new Error('no card in this tab');
+    const x = info.rect.x + info.rect.width / 2;
+    const y = info.rect.y + info.rect.height / 2;
+    for (const [type, extra] of [['mouseMoved', {}], ['mousePressed', { button: 'left', clickCount: 1 }], ['mouseReleased', { button: 'left', clickCount: 1 }]]) {
+      await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', { type, x, y, ...extra });
+    }
+    return {};
+  },
+
+  async 'test.navigate'({ tabId, url }) {
+    await chrome.tabs.update(tabId, { url });
     return {};
   },
 
@@ -562,6 +698,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   attached.delete(tabId);
   used.delete(tabId);
   if (lent.delete(tabId)) await saveLent();
+  if (handoffs.delete(tabId)) send({ event: 'handoffAborted', tabId, reason: 'the tab was closed' });
   const name = sessionOf(tabId);
   if (!name) return;
   const s = sessions[name];

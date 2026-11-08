@@ -67,7 +67,7 @@ async function main() {
   if (!/^[A-Za-z0-9._-]{1,64}$/.test(session)) fail(`bad session name "${session}". Use letters, digits, ".", "_", "-" (max 64).`);
   const timeoutMs = flag('timeout') ? Number(flag('timeout')) : 30000;
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) fail('--timeout needs a number of milliseconds');
-  const wait = timeoutMs + 15000;
+  const wait = timeoutMs + Number(process.env.BUU_WAIT_GRACE_MS ?? 15000); // the host answers at timeoutMs. The grace covers slow replies.
 
   switch (cmd) {
     case undefined:
@@ -164,7 +164,9 @@ async function main() {
         if (process.stdin.isTTY) fail('usage: buu js "<code>" (or pipe code on stdin)');
         code = await readStdin();
       }
-      const r = await request(pickBrowser(flag('browser')), { cmd: 'js', session, code, timeoutMs }, wait);
+      const r = await request(pickBrowser(flag('browser')), { cmd: 'js', session, code, timeoutMs }, wait, (e) => {
+        if (e.event === 'handoff') process.stderr.write(`buu: waiting for the user in tab ${e.tabId}: ${oneLine(e.message)}\n`);
+      });
       if (r.output) process.stdout.write(r.output.endsWith('\n') ? r.output : `${r.output}\n`);
       if (!r.ok) {
         process.stderr.write(`${r.error}\n`);

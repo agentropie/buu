@@ -14,6 +14,8 @@ export type Request = {
   params?: Record<string, unknown>;
   timeoutMs?: number;
 };
+/** Progress frame before the final answer. The CLI shows it and pauses its own timeout. */
+export type Event = { event: 'handoff'; tabId: number; message: string } | { event: 'handoffEnd' };
 export type Response = { ok: true; data?: unknown; output?: string } | { ok: false; error: string; output?: string };
 
 /** The CLI socket. One request and one response for each connection. */
@@ -36,10 +38,18 @@ export function startServer(hub: Hub, path: string, info: () => unknown): Promis
       }
       if (!msgs.length) return;
       handled = true;
-      handle(hub, msgs[0] as Request, info).then(
-        (res) => sock.end(encodeFrame(res)),
-        (e) => sock.end(encodeFrame({ ok: false, error: String(e?.message ?? e) })),
+      const req = msgs[0] as Request;
+      let answered = false;
+      const emit = (e: Event) => {
+        if (!sock.destroyed) sock.write(encodeFrame(e));
+      };
+      handle(hub, req, info, emit).then(
+        (res) => ((answered = true), sock.end(encodeFrame(res))),
+        (e) => ((answered = true), sock.end(encodeFrame({ ok: false, error: String(e?.message ?? e) }))),
       );
+      sock.on('close', () => {
+        if (!answered && req.cmd === 'js') hub.abortCall(req.session ?? 'default');
+      });
     });
     sock.on('error', () => {});
   });
@@ -52,7 +62,7 @@ export function startServer(hub: Hub, path: string, info: () => unknown): Promis
   });
 }
 
-async function handle(hub: Hub, req: Request, info: () => unknown): Promise<Response> {
+async function handle(hub: Hub, req: Request, info: () => unknown, emit: (e: Event) => void): Promise<Response> {
   const session = req.session ?? 'default';
   const timeoutMs = req.timeoutMs ?? 30000;
   switch (req.cmd) {
@@ -63,7 +73,7 @@ async function handle(hub: Hub, req: Request, info: () => unknown): Promise<Resp
     case 'tabs':
       return { ok: true, data: await hub.listUserTabs() };
     case 'js': {
-      const r = await hub.runJs(session, req.code ?? '', timeoutMs);
+      const r = await hub.runJs(session, req.code ?? '', timeoutMs, emit);
       return r.ok ? { ok: true, output: r.output ?? '' } : { ok: false, error: r.error ?? 'error', output: r.output };
     }
     case 'claim':

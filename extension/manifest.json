@@ -6,7 +6,7 @@
   "minimum_chrome_version": "125",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3EW1+6delGP1JUoIjGyqk1jSL9sCjrNi4PsRwqU8tid2WYbds693UX5j+HRrhe4/Gst3A5xqW+VqDnF5//Jo8dysyo1Foj0QJKcry10RuoqbfkDr9JJRCBI6iGXwg/ppSDc7fYrfp27uPn5aFjI/4PRjjFysMCHvwGOHVN9Gc4DJYJL+tSKoKmb99i4cQM5IOHacdZ1M91AdgoH02zBI53LTuKjjLe9kyeartdvWyVP9jCeOFs8lvXd5PD5+8RCVyHQ5xLJ1EYB4VPoBRnTris3K0uw5gs8JPsT5Tym2A4e+UCLn3ncthad0JuWOJJmY05raqAEvm1qXKTl0MxI87QIDAQAB",
   "background": { "service_worker": "background.js" },
-  "permissions": ["debugger", "tabs", "tabGroups", "nativeMessaging", "alarms", "storage"],
+  "permissions": ["debugger", "tabs", "tabGroups", "nativeMessaging", "alarms", "storage", "scripting"],
   "host_permissions": ["<all_urls>"],
   "icons": { "16": "icons/icon-16.png", "32": "icons/icon-32.png", "48": "icons/icon-48.png", "128": "icons/icon-128.png" },
   "action": { "default_title": "buu", "default_icon": { "16": "icons/icon-16.png", "32": "icons/icon-32.png" } }

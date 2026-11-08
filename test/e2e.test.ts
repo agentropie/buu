@@ -51,16 +51,22 @@ function buuWithInput(input: string, ...args: string[]): Promise<{ stdout: strin
 type Result = { stdout: string; stderr: string; code: number };
 
 /** Start the CLI and do not wait. `err()` shows the stderr so far. */
-function buuBg(...args: string[]): { done: Promise<Result>; err: () => string } {
+function buuBg(...args: string[]): { done: Promise<Result>; err: () => string; kill: () => void } {
+  return buuBgEnv({}, ...args);
+}
+
+function buuBgEnv(extra: NodeJS.ProcessEnv, ...args: string[]): { done: Promise<Result>; err: () => string; kill: () => void } {
   let err = '';
+  let kill = () => {};
   const done = new Promise<Result>((resolve) => {
-    const child = execFile(process.execPath, [cli, ...args], { env }, (e, stdout, stderr) => {
+    const child = execFile(process.execPath, [cli, ...args], { env: { ...env, ...extra } }, (e, stdout, stderr) => {
       resolve({ stdout, stderr, code: e ? ((e as { code?: number }).code ?? 1) : 0 });
     });
     child.stderr!.on('data', (d) => (err += d));
     child.stdin!.end();
+    kill = () => child.kill('SIGKILL');
   });
-  return { done, err: () => err };
+  return { done, err: () => err, kill: () => kill() };
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -483,6 +489,83 @@ describe('buu e2e on Chrome for Testing', { skip: chrome ? false : 'Chrome for T
     assert.match(r.stderr, /2 tabs are lent/);
     assert.equal((r.stderr.match(/\[lent\]/g) ?? []).length, 2);
     for (const id of ids.slice(0, 2)) await ext('test.toolbarClick', { tabId: id });
+  });
+
+  describe('v1.1: handoff', () => {
+    const agentTab = async () => Number(/tab (\d+)  \[buu · H\]/.exec((await buu('status')).stdout)![1]);
+    const cardShown = (id: number) => async () => (await ext('test.card', { tabId: id })) !== null;
+
+    test('waits past the CLI timeout, shows the card and WAIT, returns after a toolbar click', async () => {
+      assert.equal((await buu('--session', 'H', 'js', `await page.goto('${base}/a')`)).code, 0);
+      const id = await agentTab();
+      // A short wait grace makes the CLI socket timeout (1000 + 300 ms) visible in this test.
+      const run = buuBgEnv({ BUU_WAIT_GRACE_MS: '300' }, '--session', 'H', '--timeout', '1000', 'js', `return await handoff('Sign in, then continue', { timeoutMs: 60000 })`);
+      await waitFor(cardShown(id), 8000, 'the handoff card');
+      const card = await ext('test.card', { tabId: id });
+      assert.equal(card.message, 'Sign in, then continue');
+      assert.equal(card.origin, base);
+      assert.equal((await ext('test.badge', { tabId: id })).text, 'WAIT');
+      assert.equal((await ext('test.tabs')).tabs.find((t: any) => t.id === id).active, true); // the user can see it
+      assert.equal(run.err(), `buu: waiting for the user in tab ${id}: Sign in, then continue\n`);
+
+      await sleep(3000); // longer than the host timeout (1000 ms) and the CLI timeout (1300 ms)
+      const early = await Promise.race([run.done, sleep(50).then(() => 'waiting')]);
+      assert.equal(early, 'waiting', 'the call timeout must pause during a handoff');
+
+      await ext('test.toolbarClick', { tabId: id }); // the user clicks the toolbar button
+      const r = await run.done;
+      assert.equal(r.code, 0, r.stderr);
+      assert.deepEqual(JSON.parse(r.stdout), { url: `${base}/a`, title: 'Page A' });
+      assert.equal(await ext('test.card', { tabId: id }), null);
+      assert.notEqual((await ext('test.badge', { tabId: id })).text, 'WAIT');
+    });
+
+    test('the card shows again after a navigation, and a real click on it continues', async () => {
+      const id = await agentTab();
+      const run = buuBg('--session', 'H', 'js', `await handoff('Pick a plan', { timeoutMs: 60000 }); return page.url()`);
+      await waitFor(cardShown(id), 8000, 'the handoff card');
+      await ext('test.navigate', { tabId: id, url: `${base}/b` });
+      await waitFor(async () => (await ext('test.card', { tabId: id }))?.href === `${base}/b`, 8000, 'the card after navigation');
+      assert.equal((await ext('test.badge', { tabId: id })).text, 'WAIT');
+      await ext('test.cardClick', { tabId: id });
+      const r = await run.done;
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(r.stdout.trim(), `"${base}/b"`);
+      assert.equal(await ext('test.card', { tabId: id }), null);
+    });
+
+    test('start runs after the card shows, and a failing start ends the handoff', async () => {
+      const id = await agentTab();
+      const ok = buuBg('--session', 'H', 'js', `await handoff('Allow it', { timeoutMs: 60000, start: async () => { state.started = true } }); return state.started`);
+      await waitFor(cardShown(id), 8000, 'the handoff card');
+      await ext('test.toolbarClick', { tabId: id });
+      assert.equal((await ok.done).stdout.trim(), 'true');
+
+      const bad = await buu('--session', 'H', 'js', `await handoff('x', { timeoutMs: 60000, start: async () => { throw new Error('start failed') } })`);
+      assert.equal(bad.code, 1);
+      assert.match(bad.stderr, /start failed/);
+      assert.equal(await ext('test.card', { tabId: id }), null);
+    });
+
+    test('the card goes away when the CLI command ends', async () => {
+      const id = await agentTab();
+      const run = buuBg('--session', 'H', 'js', `await handoff('Anyone?', { timeoutMs: 60000 })`);
+      await waitFor(cardShown(id), 8000, 'the handoff card');
+      run.kill(); // the agent harness cancels the command
+      await waitFor(async () => (await ext('test.card', { tabId: id })) === null, 8000, 'the card to go away');
+      assert.notEqual((await ext('test.badge', { tabId: id })).text, 'WAIT');
+    });
+
+    test('a handoff that nobody answers times out, removes the card, and keeps the kernel', async () => {
+      const id = await agentTab();
+      const r = await buu('--session', 'H', 'js', `state.k = 1; await handoff('Hello?', { timeoutMs: 1500 })`);
+      assert.equal(r.code, 1);
+      assert.match(r.stderr, /handoff timed out/);
+      assert.equal(await ext('test.card', { tabId: id }), null);
+      assert.notEqual((await ext('test.badge', { tabId: id })).text, 'WAIT');
+      assert.equal((await buu('--session', 'H', 'js', 'return state.k')).stdout.trim(), '1'); // same kernel
+      await buu('--session', 'H', 'end');
+    });
   });
 
   test('8 (host crash): the extension starts the host again within 15 s', async () => {

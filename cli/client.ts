@@ -1,31 +1,57 @@
 import { connect } from 'node:net';
 import { FrameDecoder, encodeFrame } from '../host/frame.ts';
 import { listEntries, type RegistryEntry } from '../host/registry.ts';
-import type { Request, Response } from '../host/server.ts';
+import type { Event, Request, Response } from '../host/server.ts';
 
-export function request(entry: RegistryEntry, req: Request, timeoutMs: number): Promise<Response> {
+/**
+ * Send one request. `onEvent` gets progress frames. While a handoff waits for the user,
+ * the timeout pauses (the host sends `handoff` and `handoffEnd`).
+ */
+export function request(entry: RegistryEntry, req: Request, timeoutMs: number, onEvent?: (e: Event) => void): Promise<Response> {
   return new Promise((resolve, reject) => {
     const sock = connect(entry.socket);
     const dec = new FrameDecoder();
-    const timer = setTimeout(() => {
-      sock.destroy();
-      reject(new Error(`no answer from the ${entry.browser} host within ${timeoutMs} ms`));
-    }, timeoutMs);
+    let timer: NodeJS.Timeout | undefined;
+    let left = timeoutMs;
+    let armedAt = 0;
+    const arm = () => {
+      armedAt = Date.now();
+      timer = setTimeout(() => {
+        sock.destroy();
+        reject(new Error(`no answer from the ${entry.browser} host within ${timeoutMs} ms`));
+      }, left);
+    };
+    const pause = () => {
+      if (!timer) return;
+      clearTimeout(timer);
+      timer = undefined;
+      left = Math.max(left - (Date.now() - armedAt), 0);
+    };
+    arm();
     sock.on('connect', () => sock.write(encodeFrame(req)));
     sock.on('data', (chunk: Buffer) => {
-      const [msg] = dec.push(chunk);
-      if (msg) {
-        clearTimeout(timer);
-        sock.destroy();
-        resolve(msg as Response);
+      for (const msg of dec.push(chunk)) {
+        const e = msg as Event;
+        if (e.event === 'handoff') {
+          pause();
+          onEvent?.(e);
+        } else if (e.event === 'handoffEnd') {
+          if (!timer) arm();
+          onEvent?.(e);
+        } else {
+          pause();
+          sock.destroy();
+          resolve(msg as Response);
+          return;
+        }
       }
     });
     sock.on('error', (e) => {
-      clearTimeout(timer);
+      pause();
       reject(new Error(`cannot reach the ${entry.browser} host: ${e.message}`));
     });
     sock.on('close', () => {
-      clearTimeout(timer);
+      pause();
       reject(new Error(`the ${entry.browser} host closed the connection`));
     });
   });

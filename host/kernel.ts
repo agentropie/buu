@@ -20,6 +20,17 @@ let out: string[] = [];
 
 process.on('unhandledRejection', () => {}); // agent code must not crash the kernel
 
+// Requests from the kernel to the host. The host answers with `{ kres, ok, data?, error? }`.
+let nextReq = 1;
+const hostPending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+function hostCall(op: string, payload: Record<string, unknown> = {}): Promise<any> {
+  const kreq = nextReq++;
+  return new Promise((resolve, reject) => {
+    hostPending.set(kreq, { resolve, reject });
+    parentPort!.postMessage({ kreq, op, ...payload });
+  });
+}
+
 function fmt(v: unknown): string {
   return typeof v === 'string' ? v : inspect(v, { depth: 4, breakLength: 120 });
 }
@@ -56,6 +67,44 @@ async function shot(opts: Record<string, unknown> = {}) {
   const path = join(shotsDir, `${session}-${n + 1}.png`);
   await page.screenshot({ ...opts, path });
   print(path);
+}
+
+/**
+ * Ask the user to do a step in the current tab (login, captcha, a permission prompt).
+ * Waits for Continue. The call timeout pauses. Throws "handoff timed out" after timeoutMs.
+ * `start` runs after the card shows (for a click that opens a prompt).
+ */
+async function handoff(message: string, opts: { timeoutMs?: number; start?: () => Promise<unknown> } = {}) {
+  if (typeof message !== 'string' || !message.trim()) throw new Error('handoff: give the user a message');
+  const page = await ensurePage();
+  // The host finds the tab. It reads a marker that we set in the page, then we remove it.
+  const probe = `buu-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await page.evaluate((t) => {
+    (globalThis as any).__buuProbe = t;
+  }, probe);
+  try {
+    await hostCall('handoffBegin', { probe, message, timeoutMs: opts.timeoutMs ?? 600000 });
+  } finally {
+    await page.evaluate(() => {
+      delete (globalThis as any).__buuProbe;
+    }).catch(() => {});
+  }
+  let startError: unknown;
+  const started = opts.start
+    ? Promise.resolve()
+        .then(opts.start)
+        .catch((e) => {
+          startError = e;
+          void hostCall('handoffCancel').catch(() => {});
+        })
+    : undefined;
+  try {
+    await hostCall('handoffWait');
+  } catch (e) {
+    throw startError ?? e;
+  }
+  await started;
+  return { url: page.url(), title: await page.title() };
 }
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (...a: string[]) => (g: object) => Promise<unknown>;
@@ -98,6 +147,7 @@ async function runJs(code: string) {
     state,
     print,
     shot,
+    handoff,
     newPage,
     usePage,
     console: quiet,
@@ -130,7 +180,14 @@ async function claim(url: string) {
   }
 }
 
-parentPort!.on('message', async (m: { id: number; op: string; code?: string; url?: string; timeoutMs?: number }) => {
+parentPort!.on('message', async (m: { id: number; op: string; code?: string; url?: string; timeoutMs?: number; kres?: number; ok?: boolean; error?: string; data?: unknown }) => {
+  if (m.kres !== undefined) {
+    const p = hostPending.get(m.kres);
+    hostPending.delete(m.kres);
+    if (m.ok) p?.resolve(m.data);
+    else p?.reject(new Error(m.error));
+    return;
+  }
   try {
     let res: object;
     if (m.op === 'init') {
