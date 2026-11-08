@@ -67,6 +67,7 @@ Use `handoff` for a step only the user can do: a login, a captcha, a permission 
 3. Do not pass `--timeout` for it. The call timeout pauses while the user acts. `timeoutMs` (default 10 minutes) sets the wait. After it, `handoff` throws `handoff timed out`.
 4. After it returns, check the result. Check the URL or an element on the page. Do not assume the step worked.
 5. `start` is an optional async function. It runs after the card shows. Use it for a click that opens a prompt.
+6. Never click the card or its Continue button. Only the user does that.
 
 ```sh
 buu js "await page.goto('https://example.com/login'); await handoff('Sign in, then click Continue'); return page.url()"
