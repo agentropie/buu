@@ -34,10 +34,15 @@ const env: NodeJS.ProcessEnv = { ...process.env, BUU_HOME: join(tmp, 'buu') };
 delete env.NODE_TEST_CONTEXT; // node --test marks child node processes. That breaks the CLI and host output.
 
 function buu(...args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
+  return buuWithInput('', ...args);
+}
+
+function buuWithInput(input: string, ...args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve) => {
-    execFile(process.execPath, [cli, ...args], { env }, (err, stdout, stderr) => {
+    const child = execFile(process.execPath, [cli, ...args], { env }, (err, stdout, stderr) => {
       resolve({ stdout, stderr, code: err ? ((err as { code?: number }).code ?? 1) : 0 });
     });
+    child.stdin!.end(input);
   });
 }
 
@@ -130,6 +135,11 @@ describe('buu e2e on Chrome for Testing', { skip: chrome ? false : 'Chrome for T
     assert.equal((await buu('js', 'return page.url()')).stdout.trim(), `"${base}/a"`);
     await buu('js', 'state.x = 1');
     assert.equal((await buu('js', 'return state.x')).stdout.trim(), '1');
+  });
+
+  test('js reads code from stdin', async () => {
+    const r = await buuWithInput('return 40 + 2', 'js');
+    assert.equal(r.stdout.trim(), '42');
   });
 
   test('the page can be read as an aria snapshot', async () => {
@@ -225,6 +235,15 @@ describe('buu e2e on Chrome for Testing', { skip: chrome ? false : 'Chrome for T
     const e = await buu('--session', 'k', 'end', '--keep', id);
     assert.match(e.stdout, /kept 1/);
     assert.match((await buu('tabs')).stdout, new RegExp(`^${id}\\t`, 'm'));
+  });
+
+  test('8 (host crash): the extension starts the host again within 15 s', async () => {
+    const pid = Number(/pid (\d+)/.exec((await buu('status')).stdout)![1]);
+    process.kill(pid, 'SIGKILL'); // the host is our own child of the test browser
+    await waitFor(async () => {
+      const m = /pid (\d+)/.exec((await buu('status')).stdout);
+      return !!m && Number(m[1]) !== pid;
+    }, 15000, 'the extension to start a new host');
   });
 
   test('8 (headless): the browser connects again after a restart', async () => {
