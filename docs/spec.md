@@ -1,6 +1,6 @@
 # buu v1 spec
 
-Status: GO WITH CHANGES from /greenlight review (claude-fable-5-1); changes applied. Platform: macOS, Chromium browsers (Chrome, Dia). Owner: Thinh.
+Status: GO WITH CHANGES from /greenlight review (claude-fable-5-1); changes applied. Platform: macOS, Chromium browsers (Chrome, Dia).
 
 ## Goal
 
@@ -18,7 +18,7 @@ The problem today: the Playwright MCP extension uses a WebSocket relay with a to
 
 ## Reference design (observed in ChatGPT, Nov 2026)
 
-Source: ChatGPT extension 1.26.1102.11740, Codex `chrome` plugin 26.1103.41825. Copies in `~/agents/iris/data/re-browser-use/`.
+Source: ChatGPT extension 1.26.1102.11740, Codex `chrome` plugin 26.1103.41825.
 
 1. Agent tool: `node_repl` MCP server, one `js` tool, persistent Node kernel.
 2. Client library in the kernel: `browser-client.mjs`, `browser-service.mjs`. It gives `agent.browsers`, `tab.playwright`, and other APIs.
