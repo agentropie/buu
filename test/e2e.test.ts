@@ -247,6 +247,31 @@ describe('buu e2e on Chrome for Testing', { skip: chrome ? false : 'Chrome for T
     await buu('--session', 'k2', 'end');
   });
 
+  test('a popup of one session joins it while another session opens tabs', async () => {
+    // Session p warms up first. Then both sessions run at the same time.
+    await buu('--session', 'p', 'js', `await page.goto('${base}/b')`);
+    await buu('--session', 'n', 'js', `await page.goto('${base}/a')`);
+    const [, r] = await Promise.all([
+      buu('--session', 'n', 'js', `for (let i = 0; i < 25; i++) { const p = await context.newPage(); await p.close() }`),
+      buu(
+        '--session',
+        'p',
+        'js',
+        `let n = 0;
+         for (let i = 0; i < 25; i++) {
+           const [p] = await Promise.all([context.waitForEvent('page'), page.evaluate(() => { window.open('${base}/pop') })]);
+           await p.waitForLoadState(); n++;
+         }
+         return n`,
+      ),
+    ]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stdout.trim(), '25');
+    assert.equal(((await buu('status')).stdout.match(/\[buu · p\]/g) ?? []).length, 26); // the page and 25 popups
+    await buu('--session', 'n', 'end');
+    await buu('--session', 'p', 'end');
+  });
+
   test('8 (host crash): the extension starts the host again within 15 s', async () => {
     const pid = Number(/pid (\d+)/.exec((await buu('status')).stdout)![1]);
     process.kill(pid, 'SIGKILL'); // the host is our own child of the test browser

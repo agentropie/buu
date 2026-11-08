@@ -395,13 +395,13 @@ const rpc = {
 // ---------- events to the host ----------
 
 // Page.windowOpen names the real opener. tab.openerTabId can be wrong (headless reports the active tab).
-const recentOpens = []; // { session, at }
-let creating = 0; // tabs.create calls in flight (their onCreated is not a popup)
+const recentOpens = []; // { session, at, url }
+let creating = 0; // tabs.create calls in flight. Their onCreated can arrive before the tab id is known.
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (source.tabId === undefined || !sessionOf(source.tabId)) return;
   if (method === 'Page.windowOpen' && !source.sessionId) {
-    recentOpens.push({ session: sessionOf(source.tabId), at: Date.now() });
+    recentOpens.push({ session: sessionOf(source.tabId), at: Date.now(), url: params?.url });
   }
   send({ event: 'cdp', tabId: source.tabId, sessionId: source.sessionId, method, params });
 });
@@ -428,17 +428,24 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 // Popups opened by a session tab join the session.
 chrome.tabs.onCreated.addListener(async (tab) => {
   await ready;
-  if (tab.id === undefined || sessionOf(tab.id) || creating > 0) return;
+  if (tab.id === undefined || sessionOf(tab.id)) return;
+  const racing = creating > 0; // a tabs.create call runs now, so this tab may be ours
   const freshOpen = () => {
     while (recentOpens.length && Date.now() - recentOpens[0].at > 3000) recentOpens.shift();
-    return recentOpens.shift();
+    // When racing, take only the open for this URL. Else we could steal the open of a real popup.
+    const url = tab.pendingUrl ?? tab.url;
+    const i = racing ? recentOpens.findIndex((o) => o.url === url) : 0;
+    return i < 0 ? undefined : recentOpens.splice(i, 1)[0];
   };
   let open = freshOpen();
   // Page.windowOpen can arrive after onCreated. Wait a short time when the tab has an opener.
-  for (let i = 0; !open && tab.openerTabId !== undefined && i < 10; i++) {
+  for (let i = 0; !open && (tab.openerTabId !== undefined || racing) && i < 10; i++) {
     await new Promise((r) => setTimeout(r, 50));
     open = freshOpen();
   }
+  // While tabs.create runs, only Page.windowOpen proves a popup. Else the tab is ours.
+  if (!open && (racing || creating > 0)) return;
+  if (sessionOf(tab.id)) return;
   const name = open?.session ?? (tab.openerTabId !== undefined ? sessionOf(tab.openerTabId) : undefined);
   log(`onCreated tab ${tab.id} opener=${tab.openerTabId} windowOpen=${open?.session} -> session ${name}`);
   if (!name) return;
