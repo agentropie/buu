@@ -1,4 +1,4 @@
-# buu
+# Browser Uber Use (Buu)
 
 Browser Uber Use. Lets any local agent use your real Chromium browser (Chrome, Dia, ...) through a browser extension.
 
