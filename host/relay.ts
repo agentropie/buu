@@ -6,6 +6,8 @@ import { createServer, type Server } from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { Hub, Session } from './hub.ts';
 
+const DEBUG = !!process.env.BUU_DEBUG;
+
 type CdpMessage = {
   id?: number;
   sessionId?: string;
@@ -20,6 +22,8 @@ type TabSession = {
   sessionId: string;
   targetInfo: any;
   children: Set<string>; // child sessions (workers, oopifs) of this tab
+  // Events held back until the Page.getFrameTree answer reaches Playwright (see #onCommand).
+  hold?: CdpMessage[];
 };
 
 export class Relay {
@@ -110,17 +114,29 @@ export class RelayConn {
   }
 
   #send(msg: CdpMessage) {
+    if (DEBUG) this.hub.log(`relay[${this.session.name}] ->`, msg.sessionId ?? '', msg.method ?? `#${msg.id}`, msg.error?.message ?? '');
     if (this.ws.readyState === this.ws.OPEN) this.ws.send(JSON.stringify(msg));
   }
 
   async #onCommand(msg: CdpMessage) {
     const { id, method, params, sessionId } = msg;
     if (id === undefined || !method) return;
+    if (DEBUG) this.hub.log(`relay[${this.session.name}] <-`, sessionId ?? '', method, `#${id}`);
+    // The extension can deliver a late-attached tab's events before the command answers.
+    // Playwright drops lifecycle and execution context events for frames it does not know yet.
+    // It learns the frames from Page.getFrameTree. So we hold the tab's events until that answer is out.
+    const held = method === 'Page.getFrameTree' ? [...this.#tabs.values()].find((t) => t.sessionId === sessionId) : undefined;
+    if (held) held.hold = [];
     try {
       const result = await this.#handle(method, params, sessionId);
       this.#send({ id, sessionId, result: result ?? {} });
     } catch (e) {
       this.#send({ id, sessionId, error: { message: String((e as Error)?.message ?? e) } });
+    }
+    if (held?.hold) {
+      const queued = held.hold;
+      held.hold = undefined;
+      for (const m of queued) this.#send(m);
     }
   }
 
@@ -208,9 +224,17 @@ export class RelayConn {
   }
 
   async #doAttach(tabId: number): Promise<TabSession> {
-    await this.hub.ext.call('attachTab', { tabId });
+    const att = await this.hub.ext.call('attachTab', { tabId });
+    if (DEBUG) this.hub.log(`attachTab[${this.session.name}]`, tabId, att);
     const res = await this.hub.ext.call('cdp', { tabId, method: 'Target.getTargetInfo', params: {} });
     const targetInfo = res?.targetInfo;
+    // A popup that Playwright sees late (after its first navigation) would wait forever for its
+    // opener's "initial navigation". Hide the opener. Playwright then reports it as a plain new page.
+    if (targetInfo) {
+      delete targetInfo.openerId;
+      delete targetInfo.openerFrameId;
+      targetInfo.canAccessOpener = false;
+    }
     const ts: TabSession = { tabId, sessionId: `pw-tab-${this.#nextSession++}`, targetInfo, children: new Set() };
     this.#tabs.set(tabId, ts);
     this.#lost.delete(tabId);
@@ -255,6 +279,8 @@ export class RelayConn {
     const child = params?.sessionId as string | undefined;
     if (method === 'Target.attachedToTarget' && child) ts.children.add(child);
     else if (method === 'Target.detachedFromTarget' && child) ts.children.delete(child);
-    this.#send({ sessionId: childSession || ts.sessionId, method, params });
+    const msg = { sessionId: childSession || ts.sessionId, method, params };
+    if (ts.hold && !childSession) ts.hold.push(msg);
+    else this.#send(msg);
   }
 }

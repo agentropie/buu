@@ -16,10 +16,13 @@ let retryTimer = null;
 let sessions = {};
 // tab ids with our debugger attached
 const attached = new Set();
+// Tabs that got CDP commands from a client. A new client must not inherit their enabled domains.
+const used = new Set();
 let instanceId = '';
 
 function log(...args) {
   console.log('[buu]', ...args);
+  send({ event: 'log', message: args.map((a) => (typeof a === 'string' ? a : String(a?.message ?? JSON.stringify(a)))).join(' ') });
 }
 
 // ---------- state ----------
@@ -36,7 +39,12 @@ const ready = (async () => {
   // After a worker restart, debugger sessions of our tabs stay attached.
   const targets = await chrome.debugger.getTargets();
   const mine = new Set(Object.values(sessions).flatMap((s) => [...s.agent, ...s.claimed]));
-  for (const t of targets) if (t.attached && t.tabId !== undefined && mine.has(t.tabId)) attached.add(t.tabId);
+  for (const t of targets) {
+    if (t.attached && t.tabId !== undefined && mine.has(t.tabId)) {
+      attached.add(t.tabId);
+      used.add(t.tabId);
+    }
+  }
 })();
 
 function save() {
@@ -171,6 +179,7 @@ async function attach(tabId) {
 
 async function detach(tabId) {
   attached.delete(tabId);
+  used.delete(tabId);
   try {
     await chrome.debugger.detach({ tabId });
   } catch {}
@@ -287,8 +296,14 @@ const rpc = {
     const target = url || 'about:blank';
     checkUrl(target);
     const windowId = await sessionWindowId(sess);
-    const tab = await chrome.tabs.create({ url: target, active: true, ...(windowId !== undefined ? { windowId } : {}) });
-    sess.agent.push(tab.id);
+    creating++;
+    let tab;
+    try {
+      tab = await chrome.tabs.create({ url: target, active: true, ...(windowId !== undefined ? { windowId } : {}) });
+      sess.agent.push(tab.id);
+    } finally {
+      creating--;
+    }
     await save();
     try {
       await attach(tab.id);
@@ -316,8 +331,12 @@ const rpc = {
   },
 
   async attachTab({ tabId }) {
+    // A new client (kernel) takes over a tab an old client used. Start from a clean debugger session.
+    // Else Runtime.enable sends no execution contexts and page.evaluate hangs.
+    const fresh = attached.has(tabId) && used.has(tabId);
+    if (fresh) await detach(tabId);
     await attach(tabId);
-    return {};
+    return { fresh };
   },
 
   async closeTab({ tabId }) {
@@ -343,6 +362,7 @@ const rpc = {
 
   async cdp({ tabId, sessionId, method, params }) {
     if (!attached.has(tabId)) await attach(tabId); // re-attach after the user clicked Cancel
+    if (method !== 'Target.getTargetInfo') used.add(tabId);
     const target = sessionId ? { tabId, sessionId } : { tabId };
     return await chrome.debugger.sendCommand(target, method, params);
   },
@@ -373,19 +393,28 @@ const rpc = {
 
 // ---------- events to the host ----------
 
+// Page.windowOpen names the real opener. tab.openerTabId can be wrong (headless reports the active tab).
+const recentOpens = []; // { session, at }
+let creating = 0; // tabs.create calls in flight (their onCreated is not a popup)
+
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (source.tabId === undefined || !sessionOf(source.tabId)) return;
+  if (method === 'Page.windowOpen' && !source.sessionId) {
+    recentOpens.push({ session: sessionOf(source.tabId), at: Date.now() });
+  }
   send({ event: 'cdp', tabId: source.tabId, sessionId: source.sessionId, method, params });
 });
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId === undefined) return;
   attached.delete(source.tabId);
+  used.delete(source.tabId);
   if (sessionOf(source.tabId)) send({ event: 'detached', tabId: source.tabId, reason });
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   attached.delete(tabId);
+  used.delete(tabId);
   const name = sessionOf(tabId);
   if (!name) return;
   const s = sessions[name];
@@ -398,9 +427,20 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 // Popups opened by a session tab join the session.
 chrome.tabs.onCreated.addListener(async (tab) => {
   await ready;
-  if (tab.openerTabId === undefined || tab.id === undefined) return;
-  const name = sessionOf(tab.openerTabId);
-  if (!name || sessionOf(tab.id)) return;
+  if (tab.id === undefined || sessionOf(tab.id) || creating > 0) return;
+  const freshOpen = () => {
+    while (recentOpens.length && Date.now() - recentOpens[0].at > 3000) recentOpens.shift();
+    return recentOpens.shift();
+  };
+  let open = freshOpen();
+  // Page.windowOpen can arrive after onCreated. Wait a short time when the tab has an opener.
+  for (let i = 0; !open && tab.openerTabId !== undefined && i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+    open = freshOpen();
+  }
+  const name = open?.session ?? (tab.openerTabId !== undefined ? sessionOf(tab.openerTabId) : undefined);
+  log(`onCreated tab ${tab.id} opener=${tab.openerTabId} windowOpen=${open?.session} -> session ${name}`);
+  if (!name) return;
   const sess = sessions[name];
   try {
     checkUrl(tab.url ?? tab.pendingUrl);

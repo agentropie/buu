@@ -1,6 +1,6 @@
 import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { HOST_NAME, wrapperPath } from '../host/paths.ts';
+import { HOST_NAME, runDir, wrapperPath } from '../host/paths.ts';
 import { listEntries } from '../host/registry.ts';
 import { request } from './client.ts';
 import { extensionId, repoRoot } from './ext-id.ts';
@@ -30,6 +30,10 @@ export async function doctor(userDataDir?: string): Promise<{ text: string; fail
     add(!!m && existsSync(m[1]), 'wrapper node path exists', 'Run: buu install (it writes the node path again)');
     add(!!m && existsSync(m[2]), 'wrapper points to host/main.ts', 'Run: buu install');
   }
+
+  // macOS limits unix socket paths to 104 bytes.
+  const sockLen = Buffer.byteLength(join(runDir, `${'0'.repeat(32)}.sock`));
+  add(sockLen < 104, `socket path fits the 104-byte limit (${sockLen} bytes)`, 'Set BUU_HOME to a shorter folder.');
 
   const id = extensionId();
   for (const dir of manifestDirs(userDataDir)) {

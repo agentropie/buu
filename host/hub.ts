@@ -69,6 +69,9 @@ export class Hub {
       case 'detached':
         for (const c of s?.conns ?? []) c.onDetached(e.tabId, e.reason);
         break;
+      case 'log':
+        this.log('ext:', e.message);
+        break;
       case 'tabRemoved':
         this.#removeTab(e.tabId);
         break;
