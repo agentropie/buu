@@ -84,7 +84,7 @@ function send(msg) {
   try {
     port.postMessage(msg);
   } catch (e) {
-    log('postMessage failed', e);
+    console.log('[buu] postMessage failed', e); // not log(): log calls send
   }
 }
 
