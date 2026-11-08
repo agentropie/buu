@@ -44,7 +44,7 @@ The host process is the runtime. Chrome starts it when the extension connects. I
 ### Extension (`extension/`)
 
 - MV3, plain JS, no build step. `minimum_chrome_version` 125 (flat debugger sessions, `tabs.lastAccessed`). Fixed `key` in `manifest.json`, so the ID is the same on every machine (ID = first 32 hex chars of SHA-256 of the DER public key, mapped to a-p).
-- Permissions: `debugger`, `tabs`, `tabGroups`, `nativeMessaging`, `alarms`, `storage`. Host permission `<all_urls>`.
+- Permissions: `debugger`, `tabs`, `tabGroups`, `nativeMessaging`, `alarms`, `storage`, `scripting` (v1.1). Host permission `<all_urls>`.
 - On start: `connectNative("dev.agentropy.buu")`. On disconnect: call `connectNative` again inside `onDisconnect` first. If that fails, use backoff (1 s, 2 s, 5 s, then every 10 s) and a `chrome.alarms` fallback every 30 s (the alarms minimum).
 - The action icon shows the state: connected, reconnecting, error. No popup UI in v1.
 - RPC from host (JSON-RPC over the port):
@@ -84,7 +84,7 @@ The host process is the runtime. Chrome starts it when the extension connects. I
 |---|---|
 | `buu js [code]` | Run JS in the session kernel. Code comes from the argument or stdin. |
 | `buu tabs` | List the user's open tabs (id, title, url). |
-| `buu claim <tabId>` | Attach a user tab to the session. It becomes the current `page`. |
+| `buu claim <tabId>` | Attach a user tab to the session. It becomes the current `page`. `--lent` claims the only lent tab (v1.1). |
 | `buu end [--keep <tabId>...]` | End the session: close its tabs, detach claimed tabs, drop the kernel. |
 | `buu status` | Connected browsers, sessions, tabs for each session. |
 | `buu cdp-url` | Print the relay URL for the session, for other CDP tools. |
@@ -100,6 +100,7 @@ Kernel globals for `buu js`:
 - `print(...values)`: output to the CLI.
 - `shot(opts?)`: save a screenshot of `page` to `~/.buu/shots/<session>-<n>.png` and print the path.
 - `newPage()`, `usePage(p)`: open a new session tab, or set the current page.
+- `handoff(message, opts?)`: ask the user to do a step in the current tab (v1.1).
 - The return value of the code is printed as JSON when it is not `undefined`.
 - Output cap: `print` output plus the result is capped at 200 KB. Past the cap, buu cuts the output and adds a line with the full size.
 
@@ -119,6 +120,53 @@ The `buu` binary comes from `npm link` in the repo (bin entry in `package.json`)
 ### Skill (`skill/SKILL.md`)
 
 Short skill for agents: when to use buu (real logged-in browser, e2e checks, visual review), the commands, the kernel globals, one example flow (open, snapshot, act, screenshot, end), and the rules: claim user tabs only by ID from `buu tabs`, always `buu end` at the end.
+
+## v1.1
+
+Three changes. They add to v1. Where they differ, v1.1 wins. New extension permission: `scripting`.
+
+Idea source: the "browse" project of anomalyco (MIT). We copied ideas only. We copied no code.
+
+### Background agent tabs
+
+- `createTab` opens the tab with `active: false`. The user keeps the view.
+- When a tab joins the session group, the extension collapses the group. It skips this if the user looks at a tab of the group. It is best effort (Dia can fail).
+- After each attach of an agent tab, the extension sends `Emulation.setFocusEmulationEnabled {enabled: true}`. The tab keeps rendering in the background.
+- The relay answers `Page.bringToFront` with the error `buu: agents cannot raise tabs; use handoff()`. `Target.activateTarget` stays a no-op success.
+- A popup that Chrome focuses by itself stays focused. buu cannot prevent this.
+
+### Handoff
+
+Kernel global: `await handoff(message, {timeoutMs = 600000, start?})`.
+
+1. The kernel finds its tab. It sets a marker in the page. The host reads the marker through the extension. The kernel removes the marker.
+2. The extension selects the tab (it never focuses the window) and opens its group. The user must see the tab. This is the only place where buu raises a tab.
+3. The extension sets the badge `WAIT` on that tab. It shows a card: the site origin, the message, and a Continue button. The card sits in a closed shadow root. It is drawn from the isolated world with `chrome.scripting`. It uses no `innerHTML` and no `<style>`. After a page load in that tab, the extension shows the card again.
+4. `start` runs after the card shows. If `start` throws, the handoff ends and `handoff` throws the same error.
+5. The user clicks Continue in the card, or clicks the toolbar button on that tab. Both call one function (`continueHandoff`). The card ignores clicks that are not trusted.
+6. On Continue, the extension removes the card and clears the badge. `handoff` returns `{url, title}`.
+7. After `timeoutMs`, the host removes the card. `handoff` throws `handoff timed out`. The kernel stays.
+8. The call timeout pauses while the handoff waits. The host pauses the kernel clock. The CLI pauses its socket clock. `buu js` needs no `--timeout` for a handoff. The time left comes back after Continue.
+9. The host sends the CLI a frame `{event: "handoff"}` and later `{event: "handoffEnd"}`. The CLI prints one line on stderr: `buu: waiting for the user in tab <id>: <message>`.
+10. The host ends the handoff if the CLI command ends, the kernel exits, the tab closes, or the native port closes.
+
+A handoff is a courtesy, not a lock. Agent code can click the card with real input events.
+
+### Lent tabs
+
+- A toolbar click on a user tab lends it. It shows the per-tab badge `ON`. A click on an agent tab does nothing. A click on a tab with a handoff means Continue.
+- The extension keeps the lent set in `chrome.storage.session`. A closed tab leaves the set.
+- `buu tabs` lists lent tabs first. It ends their line with `[lent]`.
+- `buu claim --lent` claims the only lent tab. It fails with the list if no tab or many tabs are lent.
+- A claimed tab shows `RUN` while a `buu js` call of its session runs. Then it shows `ON` again.
+- `buu end` detaches a claimed tab. If the tab is lent, it stays lent.
+- A toolbar click on a lent or claimed tab takes it back. The extension detaches the debugger, drops the tab from the session, and clears the badge. The host stops the running call (it ends the kernel). The next `buu js` call of that session fails once with `the user took tab <id> back`.
+- The relay refuses `Target.closeTarget` and `Page.close` for a lent or claimed tab. `buu end` never closes it. Playwright `page.close()` hides the refusal and waits. The tab stays open.
+- The global badge (`on`, `...`, `!`) shows the connection. A per-tab badge overrides it on its tab only. Without a per-tab state, the tab shows the global badge.
+
+### Test hook
+
+Nobody can click the toolbar in headless Chrome. The extension has test methods named `test.*`. The host forwards them only if `BUU_TEST=1` is in its environment. The CLI reaches them with the hidden command `buu __test <method> [json]`. It is not in `buu help`. The toolbar click goes through `onToolbarClick`. Both Continue paths go through `continueHandoff`.
 
 ## Non-goals for v1
 

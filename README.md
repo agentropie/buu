@@ -47,10 +47,23 @@ To let agents use the skill, link `skill/` into the skills folder of your agent,
 buu js "<code>"          # run Playwright code in your session
 buu tabs                 # list your open tabs
 buu claim <tabId>        # use one of your tabs
+buu claim --lent         # use the tab the user lent
 buu end                  # close the session tabs
 ```
 
-See `skill/SKILL.md` for the globals (`page`, `state`, `print`, `shot`, ...) and the rules.
+See `skill/SKILL.md` for the globals (`page`, `state`, `print`, `shot`, `handoff`, ...) and the rules.
+
+### Agent tabs stay in the background
+
+Agent tabs open in the background, in a collapsed tab group. They do not take your focus. Agent code cannot raise a tab.
+
+### Lend a tab
+
+Click the buu toolbar button on one of your tabs. The badge shows `ON`. The tab is lent. `buu tabs` lists it first with `[lent]`. An agent claims it with `buu claim --lent`. The badge shows `RUN` while a command runs on it. Click the button again to take the tab back. buu detaches the tab and stops the running command. An agent cannot close a lent or claimed tab.
+
+### Handoff
+
+An agent can ask you for a step, for example a login or a captcha. The tab opens, the badge shows `WAIT`, and a card with the message appears in the page. Do the step. Then click Continue in the card, or click the buu toolbar button. The agent goes on. The command does not time out while it waits.
 
 ## Files and logs
 
@@ -86,3 +99,8 @@ Chrome starts the host and checks the extension ID in the host manifest. No toke
 - One client at a time for each session. A second kernel resets the debugger session of the tabs.
 - A message to Chrome is at most 1 MB (native messaging limit).
 - Chrome shows "buu is debugging this browser" on attached tabs.
+- A popup that Chrome focuses on its own still takes focus.
+- `page.close()` on a lent or claimed tab waits for a close that never comes. buu refuses the close. The tab stays open.
+- The handoff card needs a normal web page. On `about:blank` the card does not show. Use the badge and the toolbar button.
+- A handoff is a courtesy, not a lock. Agent code can click the card.
+- Background tab rendering and the toolbar click are tested with fake input. Check them by hand in a headed browser.

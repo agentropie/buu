@@ -25,6 +25,7 @@ Then ask the user to load the `extension/` folder unpacked in `chrome://extensio
 | `buu js "<code>"` | Run JS in your session kernel. Code can also come from stdin. |
 | `buu tabs` | List the user's tabs: `id`, title, URL. |
 | `buu claim <tabId>` | Attach a user tab to your session. It becomes `page`. |
+| `buu claim --lent` | Attach the one tab the user lent. Fails if none or many are lent. |
 | `buu end [--keep <tabId>...]` | Close your tabs, detach claimed tabs, drop the kernel. |
 | `buu status` | Show browsers, sessions, and tabs. |
 | `buu cdp-url` | Print the CDP URL of the session for other CDP tools. |
@@ -40,6 +41,7 @@ Use a unique session name for each task, for example `--session review-login`. O
 - `state`: a plain object. It persists across calls. Top-level `const` and `let` do not persist.
 - `print(...values)`: write to the output. `console.log` does the same.
 - `shot(opts?)`: save a screenshot of `page` to `~/.buu/shots/<session>-<n>.png` and print the path. Read the PNG to see it.
+- `handoff(message, {timeoutMs = 600000, start})`: ask the user to do a step in the current tab. It waits for Continue. It returns `{url, title}`. See "Handoff".
 - `newPage()`: open a new session tab and make it `page`. `usePage(p)`: make `p` the current page.
 - The return value prints as JSON (a string prints with quotes). Use `print` for plain text. Output is cut at 200 KB.
 
@@ -56,6 +58,22 @@ buu js "await shot()"                                          # prints the PNG 
 buu end
 ```
 
+## Handoff
+
+Use `handoff` for a step only the user can do: a login, a captcha, a permission prompt, a payment.
+
+1. Tell the user in chat first. Say which tab and what to do. The tab comes to the front when you call `handoff`.
+2. Call `handoff("Sign in, then click Continue")`. Write a short message. It shows on a card in the page.
+3. Do not pass `--timeout` for it. The call timeout pauses while the user acts. `timeoutMs` (default 10 minutes) sets the wait. After it, `handoff` throws `handoff timed out`.
+4. After it returns, check the result. Check the URL or an element on the page. Do not assume the step worked.
+5. `start` is an optional async function. It runs after the card shows. Use it for a click that opens a prompt.
+
+```sh
+buu js "await page.goto('https://example.com/login'); await handoff('Sign in, then click Continue'); return page.url()"
+```
+
+The user can also lend a tab with the toolbar button. Prefer `buu claim --lent` to a guessed ID. The user can take a lent tab back at any time. Then the running call stops. The next call fails once with "the user took tab <id> back". Do not claim it again. Ask the user.
+
 ## Rules
 
 1. Claim a user tab only by an ID from `buu tabs`. Never guess an ID. Claim only if the user asked, or the task needs their open page.
@@ -65,4 +83,6 @@ buu end
 5. buu refuses `chrome://`, `chrome-extension://`, and Web Store URLs.
 6. Prefer `context.on('page')` or `context.waitForEvent('page')` for popups. `page.on('popup')` does not fire.
 7. Chrome shows "buu is debugging this browser". If the user clicks Cancel, buu attaches again on the next call.
-8. Do not run two clients on the same session at once. A second kernel or CDP client takes over the tabs.
+8. Never raise a tab. `page.bringToFront()` fails by design. Use `handoff` when the user must see a tab.
+9. Never close a lent or claimed tab. buu refuses it.
+10. Do not run two clients on the same session at once. A second kernel or CDP client takes over the tabs.
