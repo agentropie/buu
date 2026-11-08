@@ -157,8 +157,9 @@ export class RelayConn {
       case 'Target.detachFromTarget':
         return {};
       case 'Page.close': {
-        // The extension refuses this for a lent or claimed tab.
-        await this.hub.ext.call('assertClosable', { tabId: this.#target(method, sessionId).tabId });
+        // The extension refuses this for a lent or claimed tab. Release it, so page.close() returns.
+        const { tabId } = this.#target(method, sessionId);
+        if (await this.#releaseIfProtected(tabId)) return {};
         break;
       }
       case 'Page.bringToFront':
@@ -185,12 +186,24 @@ export class RelayConn {
       case 'Target.closeTarget': {
         const ts = [...this.#tabs.values()].find((t) => t.targetInfo?.targetId === params?.targetId);
         if (!ts) return { success: false };
+        if (await this.#releaseIfProtected(ts.tabId)) return { success: true };
         await this.hub.closeTab(this.session, ts.tabId);
         return { success: true };
       }
     }
     const target = this.#target(method, sessionId);
     return await this.hub.ext.call('cdp', { ...target, method, params });
+  }
+
+  /** A lent or claimed tab stays open. The agent loses it instead. Returns true when it did. */
+  async #releaseIfProtected(tabId: number): Promise<boolean> {
+    try {
+      await this.hub.ext.call('assertClosable', { tabId });
+      return false;
+    } catch {
+      await this.hub.releaseTab(tabId);
+      return true;
+    }
   }
 
   // 1. no sessionId: browser-level command. Route through any attached tab of the session.

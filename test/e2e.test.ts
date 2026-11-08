@@ -496,11 +496,25 @@ describe('buu e2e on Chrome for Testing', { skip: chrome ? false : 'Chrome for T
       }),
     );
     ws.send(JSON.stringify({ id: 2, method: 'Target.closeTarget', params: { targetId } }));
-    assert.match((await reply).error?.message, /agents cannot close a lent or claimed tab/);
+    assert.deepEqual((await reply).result, { success: true }); // the agent loses the tab
     ws.close();
+    assert.match((await buu('tabs')).stdout, /User Page/); // the tab stays open
+    assert.doesNotMatch((await buu('status')).stdout, new RegExp(`tab ${id} `));
+    await buu('--session', 'X', 'end');
     assert.match((await buu('tabs')).stdout, /User Page/);
-    await buu('--session', 'X', 'end'); // never closes a claimed tab
+    await ext('test.toolbarClick', { tabId: id }); // take back
+  });
+
+  test('v1.1: page.close() on a claimed tab returns and leaves the tab open', async () => {
+    const id = Number(/^(\d+)\t.*User Page/m.exec((await buu('tabs')).stdout)![1]);
+    await ext('test.toolbarClick', { tabId: id });
+    assert.equal((await buu('--session', 'P', 'claim', '--lent')).code, 0);
+    const t0 = Date.now();
+    const r = await buu('--session', 'P', 'js', 'await page.close(); return "closed"');
+    assert.equal(r.code, 0, r.stderr);
+    assert.ok(Date.now() - t0 < 15000, 'page.close() must not wait for a timeout');
     assert.match((await buu('tabs')).stdout, /User Page/);
+    await buu('--session', 'P', 'end');
     await ext('test.toolbarClick', { tabId: id }); // take back
   });
 
